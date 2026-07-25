@@ -251,7 +251,7 @@ return [
     'heartbeat_interval' => (int) env('TASKFLOW_HEARTBEAT_INTERVAL', 60),
 
     'aws' => [
-        'region'     => env('AWS_DEFAULT_REGION', 'ap-southeast-1'),
+        'region'     => env('AWS_DEFAULT_REGION', 'us-east-1'),
         'account_id' => env('AWS_ACCOUNT_ID'),
     ],
 ];

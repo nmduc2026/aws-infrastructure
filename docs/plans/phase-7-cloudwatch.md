@@ -258,7 +258,7 @@ resource "aws_cloudwatch_metric_alarm" "billing" {
 }
 ```
 
-> 💡 Metric `AWS/Billing` **chỉ tồn tại ở us-east-1**, bất kể bạn triển khai ở đâu. Cần cả một SNS topic ở us-east-1 vì alarm chỉ gọi được SNS cùng region. Đây là lý do guardrail ở Phase 0 vẫn cho phép us-east-1.
+> 💡 Metric `AWS/Billing` **chỉ tồn tại ở us-east-1**, bất kể bạn triển khai ở đâu. Cần cả một SNS topic ở us-east-1 vì alarm chỉ gọi được SNS cùng region. Dự án triển khai luôn ở us-east-1 nên không phải xử lý cross-region ở đây.
 
 ### `treat_missing_data` — chi tiết quan trọng
 

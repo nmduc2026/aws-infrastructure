@@ -43,7 +43,7 @@ Message retention period: 14 days        ← tối đa, để có thời gian đ
 Receive message wait    : 20 giây
 ```
 
-Tạo xong, copy **ARN** (dạng `arn:aws:sqs:ap-southeast-1:123456789012:taskflow-jobs-dlq`).
+Tạo xong, copy **ARN** (dạng `arn:aws:sqs:us-east-1:123456789012:taskflow-jobs-dlq`).
 
 ### Bước 2 — Tạo queue chính
 
@@ -99,7 +99,7 @@ Tạo IAM user `taskflow-app-local` (Console → IAM → Users → Create user, 
       "Sid": "SendJobsOnly",
       "Effect": "Allow",
       "Action": ["sqs:SendMessage", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
-      "Resource": "arn:aws:sqs:ap-southeast-1:ACCOUNT_ID:taskflow-jobs"
+      "Resource": "arn:aws:sqs:us-east-1:ACCOUNT_ID:taskflow-jobs"
     },
     {
       "Sid": "WorkerConsume",
@@ -109,8 +109,8 @@ Tạo IAM user `taskflow-app-local` (Console → IAM → Users → Create user, 
         "sqs:ChangeMessageVisibility", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"
       ],
       "Resource": [
-        "arn:aws:sqs:ap-southeast-1:ACCOUNT_ID:taskflow-jobs",
-        "arn:aws:sqs:ap-southeast-1:ACCOUNT_ID:taskflow-jobs-dlq"
+        "arn:aws:sqs:us-east-1:ACCOUNT_ID:taskflow-jobs",
+        "arn:aws:sqs:us-east-1:ACCOUNT_ID:taskflow-jobs-dlq"
       ]
     }
   ]
@@ -124,7 +124,7 @@ Tạo access key, thêm vào `backend/.env`:
 ```dotenv
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
-AWS_DEFAULT_REGION=ap-southeast-1
+AWS_DEFAULT_REGION=us-east-1
 AWS_ACCOUNT_ID=123456789012
 ```
 

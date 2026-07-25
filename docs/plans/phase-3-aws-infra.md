@@ -44,7 +44,7 @@ Tạo bucket bằng tay (chỉ một lần, không thể dùng Terraform để t
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile taskflow)
-REGION=ap-southeast-1
+REGION=us-east-1
 
 aws s3api create-bucket \
   --bucket taskflow-tfstate-$ACCOUNT_ID \
@@ -77,7 +77,7 @@ terraform {
   backend "s3" {
     bucket       = "taskflow-tfstate-123456789012"   # thay ACCOUNT_ID
     key          = "learning/terraform.tfstate"      # prod-like dùng key KHÁC -> state tách biệt
-    region       = "ap-southeast-1"
+    region       = "us-east-1"
     encrypt      = true
     use_lockfile = true                              # khóa chống chạy apply đồng thời
   }
@@ -101,7 +101,7 @@ provider "aws" {
 `variables.tf`:
 
 ```hcl
-variable "region"      { type = string  default = "ap-southeast-1" }
+variable "region"      { type = string  default = "us-east-1" }
 variable "project"     { type = string  default = "taskflow" }
 variable "environment" { type = string  default = "learning" }
 variable "db_password" { type = string  sensitive = true }
@@ -285,9 +285,9 @@ Import:
 
 ```bash
 terraform import 'module.queues.aws_sqs_queue.jobs' \
-  https://sqs.ap-southeast-1.amazonaws.com/ACCOUNT_ID/taskflow-jobs
+  https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/taskflow-jobs
 terraform import 'module.queues.aws_sqs_queue.jobs_dlq' \
-  https://sqs.ap-southeast-1.amazonaws.com/ACCOUNT_ID/taskflow-jobs-dlq
+  https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/taskflow-jobs-dlq
 # tương tự cho 2 queue notifications
 ```
 
@@ -469,7 +469,7 @@ Build và push — `scripts/build-push.sh`:
 set -euo pipefail
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile taskflow)
-REGION=ap-southeast-1
+REGION=us-east-1
 REPO="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/taskflow-worker"
 TAG=$(git rev-parse --short HEAD)     # tag = git SHA, KHÔNG dùng :latest
 
@@ -754,7 +754,7 @@ RDS đang trống. Vì `publicly_accessible = true` và SG đã cho IP của b�
 ```bash
 cd backend
 # .env trỏ tới RDS endpoint
-DB_HOST=taskflow-db.xxxx.ap-southeast-1.rds.amazonaws.com php artisan migrate --force
+DB_HOST=taskflow-db.xxxx.us-east-1.rds.amazonaws.com php artisan migrate --force
 ```
 
 > Ở Phase 8 khi RDS nằm trong private subnet, cách này không dùng được nữa — lúc đó dùng `aws ecs run-task` với một one-off task. Xem `scripts/migrate.sh` ở Phase 8.

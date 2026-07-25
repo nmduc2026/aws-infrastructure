@@ -136,7 +136,7 @@ Nguyên tắc: **không dùng root cho việc hằng ngày**. Lý do không ph�
     "Resource": "*",
     "Condition": {
       "StringNotEquals": {
-        "aws:RequestedRegion": ["ap-southeast-1", "us-east-1"]
+        "aws:RequestedRegion": ["us-east-1"]
       }
     }
   }]
@@ -145,7 +145,7 @@ Nguyên tắc: **không dùng root cho việc hằng ngày**. Lý do không ph�
 
 `NotAction` liệt kê các dịch vụ **global** — chúng không có region nên phải loại trừ, nếu không bạn sẽ không tạo được cả IAM role.
 
-Vì sao vẫn cho phép `us-east-1` dù chọn `ap-southeast-1`: metric `AWS/Billing` **chỉ tồn tại ở us-east-1**, nên alarm `BillingAlert` (9.6) bắt buộc phải tạo ở đó.
+Chỉ một region trong danh sách vì dự án chọn `us-east-1` — cũng là nơi duy nhất có metric `AWS/Billing`, nên alarm `BillingAlert` (9.6) tạo được ngay trong region này.
 
 #### Guardrail 2 — Chặn dịch vụ đắt
 
@@ -214,7 +214,7 @@ Một EKS cluster là $73/tháng chỉ riêng control plane, MSK rẻ nhất cũ
     {
       "Effect": "Allow",
       "Action": ["sqs:SendMessage", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
-      "Resource": "arn:aws:sqs:ap-southeast-1:ACCOUNT_ID:taskflow-jobs"
+      "Resource": "arn:aws:sqs:us-east-1:ACCOUNT_ID:taskflow-jobs"
     },
     {
       "Effect": "Allow",
@@ -283,7 +283,7 @@ Budget này theo dõi **tổng credits đã đốt trong cả vòng đời dự 
    Trong Terraform, đặt ở `provider` để khỏi lặp lại:
    ```hcl
    provider "aws" {
-     region = "ap-southeast-1"
+     region = "us-east-1"
      default_tags {
        tags = {
          Project     = "taskflow"
@@ -293,7 +293,7 @@ Budget này theo dõi **tổng credits đã đốt trong cả vòng đời dự 
      }
    }
    ```
-6. **Chọn 1 region duy nhất** và không bao giờ đổi. Đề xuất `ap-southeast-1` (Singapore, gần VN, latency thấp) hoặc `us-east-1` (rẻ nhất, đủ mọi dịch vụ). Tài liệu này dùng giá `us-east-1`; `ap-southeast-1` đắt hơn khoảng 10–20%. Đã chốt thì khóa lại bằng Guardrail 1 ở 0.3.2.
+6. **Chọn 1 region duy nhất** và không bao giờ đổi. Dự án dùng `us-east-1` (Virginia) — rẻ nhất, đủ mọi dịch vụ, và là nơi duy nhất có metric billing. `ap-southeast-1` (Singapore) gần VN hơn nhưng đắt hơn 10–20%. Đã chốt thì khóa lại bằng Guardrail 1 ở 0.3.2.
 7. **Đặt lịch nhắc** kiểm tra Cost Explorer mỗi Chủ nhật, và một lịch nhắc **destroy Phase 8** đặt ngay khi bắt đầu phase đó.
 
 ### 0.3.5. Checklist Phase 0

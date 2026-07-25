@@ -51,7 +51,7 @@ terraform {
   backend "s3" {
     bucket  = "taskflow-tfstate-123456789012"
     key     = "prod-like/terraform.tfstate"    # KHÁC "learning/terraform.tfstate"
-    region  = "ap-southeast-1"
+    region  = "us-east-1"
     encrypt = true
   }
 }
@@ -267,7 +267,7 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::ACCOUNT_ID:role/taskflow-github-actions
-          aws-region: ap-southeast-1
+          aws-region: us-east-1
 
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr

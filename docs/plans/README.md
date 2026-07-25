@@ -103,7 +103,7 @@ Chốt một lần, dùng suốt 8 phase. Đổi tên giữa chừng là nguồn
 
 ```
 Prefix chung        : taskflow
-Region              : ap-southeast-1        (điền region bạn chọn ở Phase 0)
+Region              : us-east-1        (điền region bạn chọn ở Phase 0)
 SQS                 : taskflow-jobs, taskflow-jobs-dlq
                       taskflow-notifications, taskflow-notifications-dlq
 ECR repository      : taskflow-api, taskflow-worker

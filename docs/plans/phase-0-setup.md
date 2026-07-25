@@ -24,7 +24,7 @@ Phase 0 mất 3 giờ để tránh điều đó.
 1. Đăng nhập AWS Console bằng root.
 2. Vào **IAM → Dashboard → Root user → Enable MFA**. Dùng app authenticator (Google Authenticator, Authy, 1Password).
 3. Vào **IAM → Dashboard → Root access keys** — nếu có access key nào, **xóa hết**. Root không bao giờ cần access key.
-4. Lưu mật khẩu root vào password manager. Từ giờ chỉ dùng root cho: đổi payment method, đổi support plan, đóng tài khoản.
+4. Lưu mật khẩu root vào password manager. Từ giờ chỉ dùng root cho: đổi payment method, đổi support plan, đóng tài khoản, và bật IAM billing access (bước 4).
 
 ### Bước 2 — Tạo IAM user cho công việc hằng ngày
 
@@ -51,7 +51,7 @@ Hai policy `Deny` để chặn những cách mất tiền phổ biến nhất. `
 
 #### Policy `taskflow-guardrail-region`
 
-> 💡 **Giải thích:** AWS chia thành ~30 **region** (vùng địa lý) độc lập. Tài nguyên tạo ở region này **không hiện ra** khi bạn đang xem region khác. Đây là cách mất tiền âm thầm phổ biến nhất: lỡ tay tạo RDS ở Virginia trong khi bạn luôn mở console ở Singapore, và nó chạy 6 tháng không ai biết. Policy này chặn tận gốc.
+> 💡 **Giải thích:** AWS chia thành ~30 **region** (vùng địa lý) độc lập. Tài nguyên tạo ở region này **không hiện ra** khi bạn đang xem region khác. Đây là cách mất tiền âm thầm phổ biến nhất: lỡ tay tạo RDS ở Singapore trong khi bạn luôn mở console ở Virginia, và nó chạy 6 tháng không ai biết. Policy này chặn tận gốc.
 
 ```json
 {
@@ -69,7 +69,7 @@ Hai policy `Deny` để chặn những cách mất tiền phổ biến nhất. `
     "Resource": "*",
     "Condition": {
       "StringNotEquals": {
-        "aws:RequestedRegion": ["ap-southeast-1", "us-east-1"]
+        "aws:RequestedRegion": ["us-east-1"]
       }
     }
   }]
@@ -78,7 +78,7 @@ Hai policy `Deny` để chặn những cách mất tiền phổ biến nhất. `
 
 `NotAction` liệt kê các dịch vụ **global** (không thuộc region nào) — phải loại trừ, nếu không bạn không tạo nổi cả IAM role.
 
-Vì sao vẫn cho `us-east-1` dù chọn Singapore: metric billing của AWS **chỉ tồn tại ở us-east-1**, nên alarm cảnh báo chi phí ở Phase 7 bắt buộc phải tạo ở đó.
+Chỉ một region duy nhất trong danh sách, vì dự án chọn `us-east-1` — cũng chính là nơi metric billing của AWS tồn tại, nên alarm chi phí ở Phase 7 tạo được ngay trong region này, không cần mở thêm ngoại lệ.
 
 #### Policy `taskflow-guardrail-expensive`
 
@@ -94,7 +94,8 @@ Vì sao vẫn cho `us-east-1` dù chọn Singapore: metric billing của AWS **c
         "kafka:CreateCluster", "kafka:CreateClusterV2",
         "redshift:CreateCluster",
         "elasticmapreduce:RunJobFlow",
-        "es:CreateDomain", "opensearch:CreateDomain",
+        "es:CreateDomain", "es:CreateElasticsearchDomain",
+        "aoss:CreateCollection",
         "sagemaker:CreateNotebookInstance", "sagemaker:CreateEndpoint",
         "fsx:CreateFileSystem",
         "directconnect:*",
@@ -102,7 +103,11 @@ Vì sao vẫn cho `us-east-1` dù chọn Singapore: metric billing của AWS **c
         "transfer:CreateServer",
         "route53domains:RegisterDomain",
         "elasticache:CreateCacheCluster",
-        "elasticache:CreateReplicationGroup"
+        "elasticache:CreateReplicationGroup",
+        "elasticache:CreateServerlessCache",
+        "rds:CreateDBCluster",
+        "ec2:CreateFleet",
+        "ec2:RequestSpotInstances"
       ],
       "Resource": "*"
     },
@@ -132,7 +137,9 @@ Vì sao vẫn cho `us-east-1` dù chọn Singapore: metric billing của AWS **c
 }
 ```
 
-Một EKS cluster là $73/tháng chỉ riêng control plane. MSK rẻ nhất ~$80/tháng. Hai cái đó thôi đã xóa sổ credits.
+Một EKS cluster là $73/tháng chỉ riêng control plane. MSK rẻ nhất ~$80/tháng. Hai cái đó thôi đã xóa sổ credits. `rds:CreateDBCluster` và `ec2:CreateFleet` bị chặn thẳng vì chúng là đường đi vòng — Aurora Serverless v2 không có instance class nên statement `OnlySmallRds` không chặn được nó.
+
+> ⚠️ Giữ nguyên `Resource` của `OnlySmallInstances` là `arn:aws:ec2:*:*:instance/*`. Đổi thành `"*"` sẽ chặn luôn cả `t3.micro`.
 
 Attach cả hai policy vào user `taskflow-admin`.
 
@@ -144,7 +151,8 @@ Attach cả hai policy vào user `taskflow-admin`.
 
 ### Bước 4 — Bật Cost Explorer
 
-**Billing and Cost Management → Cost Explorer → Enable.**
+1. **Đăng nhập root** → **Account** → **IAM user and role access to billing information** → **Edit** → tick **Activate IAM access** → **Update**. Chỉ root mở được công tắc này; không bật thì `taskflow-admin` gặp `Access denied` ở mọi trang Billing (bước 4–7).
+2. Đăng nhập lại `taskflow-admin` → **Billing and Cost Management → Cost Explorer → Enable.**
 
 > 💡 **Giải thích:** Cost Explorer là công cụ xem chi tiêu theo ngày/dịch vụ/tag. Lần đầu bật mất **tới 24 giờ** mới có dữ liệu, nên làm ngay hôm nay để mai đã dùng được.
 
@@ -154,7 +162,9 @@ Attach cả hai policy vào user `taskflow-admin`.
 
 > ⚠️ **BẪY QUAN TRỌNG NHẤT CỦA PHASE 0:** Budget mặc định tính chi phí **sau khi trừ credits**. Bạn đang có $200 credits → chi tiêu hiển thị luôn là **$0** → budget **không bao giờ bắn** cho tới khi credits cạn sạch, đúng lúc quá muộn.
 >
-> Khi tạo budget, mở **Advanced options** và **BỎ TICK "Credits"** (và "Refunds"). Khi đó budget theo dõi chi tiêu gộp — chính là tốc độ đốt credits.
+> Cách chặn: ở **Budget scope** chọn **Filter specific AWS cost dimensions** → **Dimension** = `Charge type` → chỉ tick `Usage` và `Tax`. Loại `Credit`/`Refund` ra khỏi phạm vi tính, budget sẽ theo dõi chi tiêu gộp — chính là tốc độ đốt credits.
+
+**Budgets → Create budget → chọn `Customize (advanced)`**, không dùng `Use a template`. Template không cho bỏ tick Credits.
 
 AWS miễn phí **2 budget**, mỗi budget hỗ trợ **5 ngưỡng cảnh báo**. Vậy 2 budget là đủ.
 
@@ -164,8 +174,7 @@ AWS miễn phí **2 budget**, mỗi budget hỗ trợ **5 ngưỡng cảnh báo*
 Type    : Cost budget
 Period  : Monthly, recurring
 Amount  : $30
-Advanced: BỎ TICK Credits, Refunds
-Filter  : (để trống — theo dõi toàn account)
+Scope   : Filter specific AWS cost dimensions → Add filter → Charge type → Values: Usage, Tax
 ```
 
 | Ngưỡng | Số tiền | Loại | Ý nghĩa |
@@ -180,27 +189,45 @@ Filter  : (để trống — theo dõi toàn account)
 
 ```
 Type    : Cost budget
-Period  : Expiring, 25/07/2026 → 22/01/2027
-Amount  : $200
-Alerts  : 25% ($50) · 50% ($100) · 75% ($150) · 90% ($180)
-Advanced: BỎ TICK Credits
+Period  : Custom, 25/07/2026 → 22/01/2027
+Amount  : $80
+Scope   : Filter specific AWS cost dimensions → Add filter → Charge type → Values: Usage, Tax
 ```
 
-Budget này không reset mỗi tháng — nó trả lời "còn bao nhiêu credits để học tiếp".
+| Ngưỡng | Số tiền | Loại | Ý nghĩa |
+|---:|---:|---|---|
+| 25% | $20 | Actual | Đang đi đúng hướng |
+| 50% | $40 | Actual | Quá nửa dự toán, còn 2–3 phase |
+| 75% | $60 | Actual | Kiểm tra có gì chạy mà quên tắt |
+| 90% | $72 | Actual | Dừng tạo mới, destroy thứ không dùng |
+
+Budget này không reset mỗi tháng — nó trả lời "đã đốt bao nhiêu trên cả dự án". Đặt $80 vì dự toán toàn bộ Phase 0–8 là ~$50; vẫn còn $120 credits đệm phía sau.
 
 ### Bước 6 — Cost Anomaly Detection
 
-**Billing → Cost Anomaly Detection → Create monitor**, kiểu **AWS services**, alert email khi lệch > $5.
+AWS tự tạo sẵn monitor `Default-Services-Monitor` (kiểu AWS services) cho account mới. Mỗi account chỉ được 1 monitor loại này, nên **không cần Create monitor** — lựa chọn đó sẽ bị khóa. Việc cần làm là gắn cảnh báo cho nó.
+
+**Billing and Cost Management → Cost Anomaly Detection → Alert subscriptions → Create subscription:**
+
+```
+Subscription name  : taskflow-anomaly-alert
+Alerting frequency : Daily summaries
+Alert recipients   : <email của bạn>
+Threshold          : $5 — amount above expected spend
+Cost monitors      : tick Default-Services-Monitor
+```
 
 Miễn phí. Nó bắt được thứ budget theo tháng bỏ sót — ví dụ một dịch vụ mới đột nhiên xuất hiện giữa tháng.
 
 ### Bước 7 — Cost Allocation Tags
 
-**Billing → Cost allocation tags → User-defined** → tìm `Project` → **Activate**.
+**Billing and Cost Management → Cost Allocation Tags** → tìm `Project` → tick → **Activate**.
 
-> 💡 **Giải thích:** Tag là cặp key-value gắn lên tài nguyên. Sau khi activate, Cost Explorer cho phép lọc chi phí theo tag. **Tag không hồi tố** — tài nguyên tạo trước khi activate sẽ không được phân loại. Đó là lý do phải làm ở Phase 0.
->
-> Tag sẽ chỉ xuất hiện trong danh sách sau khi có ít nhất một tài nguyên mang tag đó. Nếu chưa thấy `Project`, quay lại bước này sau Phase 2.
+**Hôm nay chưa làm được, và đó là bình thường.** Danh sách chỉ hiện tag nào đã có ít nhất một tài nguyên mang nó, mà Phase 0 chưa tạo tài nguyên nào. Account mới chỉ thấy `Name` và `aws:createdBy` — AWS tự sinh, cứ để `Inactive`, không cần làm gì.
+
+`Project` sẽ xuất hiện sau khi Terraform ở Phase 3 tạo tài nguyên đầu tiên. **Quay lại activate ngay lúc đó.**
+
+> 💡 **Giải thích:** Tag là cặp key-value gắn lên tài nguyên. Sau khi activate, Cost Explorer cho phép lọc chi phí theo tag. **Tag không hồi tố** — chi phí phát sinh trước lúc activate sẽ không được phân loại, nên activate càng sớm càng tốt.
 
 ---
 
@@ -211,15 +238,15 @@ Chọn **một** region và không bao giờ đổi:
 | Region | Ưu | Nhược |
 |---|---|---|
 | `ap-southeast-1` (Singapore) | Gần VN, ping ~30–50ms | Đắt hơn us-east-1 ~10–20% |
-| `us-east-1` (Virginia) | Rẻ nhất, có mọi dịch vụ sớm nhất | Ping ~250ms |
+| `us-east-1` (Virginia) | Rẻ nhất, có mọi dịch vụ sớm nhất, là nơi duy nhất có metric billing | Ping ~250ms |
 
-Với dự án học tập, latency không quan trọng bằng chi phí, nhưng chênh lệch 15% trên $100 chỉ là $15 — nên cứ chọn cái nào bạn thấy thoải mái. Tài liệu này dùng `ap-southeast-1` trong ví dụ.
+**Dự án này dùng `us-east-1`** — toàn bộ tài liệu đã theo region đó. Với dự án học tập, latency không quan trọng: bạn không phục vụ người dùng thật, và 250ms chỉ ảnh hưởng lúc bấm nút trên console hay gọi API từ máy local. Bù lại được giá rẻ nhất và không phải mở ngoại lệ region cho alarm billing ở Phase 7.
 
 **Ghi lại lựa chọn:**
 
 ```
-Region đã chọn: ______________________
-AWS Account ID: ______________________
+Region đã chọn: us-east-1
+AWS Account ID: 621646470792
 ```
 
 Account ID lấy ở góc trên phải console. Bạn sẽ cần nó nhiều lần (tên S3 bucket, ARN).
@@ -234,7 +261,7 @@ Account ID lấy ở góc trên phải console. Bạn sẽ cần nó nhiều l�
 |---|---|---|
 | PHP | 8.1+ | `php -v` |
 | Composer | 2.x | `composer -V` |
-| Node.js | 18+ | `node -v` |
+| Node.js | 20+ | `node -v` |
 | Docker Desktop | mới nhất | `docker -v` |
 | AWS CLI | v2 | `aws --version` |
 | Terraform | 1.6+ | `terraform -v` |
@@ -257,7 +284,7 @@ winget install HashiCorp.Terraform
 aws configure --profile taskflow
 # AWS Access Key ID     : (key của taskflow-admin)
 # AWS Secret Access Key : (secret)
-# Default region name   : ap-southeast-1
+# Default region name   : us-east-1
 # Default output format : json
 ```
 
@@ -281,10 +308,29 @@ Kiểm tra guardrail có hoạt động không — lệnh này **phải bị t�
 
 ```bash
 aws ec2 describe-vpcs --region eu-west-1 --profile taskflow
-# Mong đợi: AccessDenied (vì eu-west-1 không nằm trong allowed regions)
+# Mong đợi: UnauthorizedOperation ... explicit deny in an identity-based policy:
+#           arn:aws:iam::<ACCOUNT_ID>:policy/taskflow-guardrail-region
 ```
 
 Nếu lệnh này **thành công**, guardrail chưa được attach đúng. Quay lại bước 3.
+
+Kiểm tra `taskflow-guardrail-expensive`. `--dry-run` đánh giá quyền rồi dừng trước khi tạo tài nguyên — miễn phí, không tạo gì:
+
+```bash
+AMI=$(aws ssm get-parameter --profile taskflow --region us-east-1 \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query Parameter.Value --output text)
+
+# Kỳ vọng: DryRunOperation  (= có quyền)
+aws ec2 run-instances --profile taskflow --region us-east-1 \
+  --image-id $AMI --instance-type t3.micro --dry-run
+
+# Kỳ vọng: UnauthorizedOperation  (= guardrail chặn)
+aws ec2 run-instances --profile taskflow --region us-east-1 \
+  --image-id $AMI --instance-type m5.large --dry-run
+```
+
+Lệnh `t3.micro` quan trọng hơn lệnh `m5.large`: nó chứng minh guardrail **không chặn oan** thứ bạn thực sự cần dùng.
 
 ---
 
@@ -359,10 +405,12 @@ Chỉ sang Phase 1 khi tick hết:
 - [ ] Root có MFA, không còn access key
 - [ ] IAM user `taskflow-admin` có MFA, `AdministratorAccess`
 - [ ] 2 guardrail policy đã attach
-- [ ] `aws ec2 describe-vpcs --region eu-west-1` trả về **AccessDenied**
+- [ ] `aws ec2 describe-vpcs --region eu-west-1` trả về **UnauthorizedOperation** kèm `explicit deny ... taskflow-guardrail-region`
+- [ ] `run-instances --instance-type t3.micro --dry-run` trả về **DryRunOperation**
+- [ ] `run-instances --instance-type m5.large --dry-run` trả về **UnauthorizedOperation**
 - [ ] `aws sts get-caller-identity` hiện đúng `taskflow-admin`
-- [ ] Budget `taskflow-monthly-gross` $30, **đã bỏ tick Credits**, 5 ngưỡng
-- [ ] Budget `taskflow-total-credits` $200 hết hạn 22/01/2027, **đã bỏ tick Credits**
+- [ ] Budget `taskflow-monthly-gross` $30, **Charge type = Usage + Tax**, 5 ngưỡng
+- [ ] Budget `taskflow-total-credits` $80 hết hạn 22/01/2027, **Charge type = Usage + Tax**
 - [ ] Cost Anomaly Detection bật
 - [ ] Cost Explorer bật
 - [ ] Region đã chốt và ghi lại
