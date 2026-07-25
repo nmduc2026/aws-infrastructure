@@ -9,7 +9,7 @@
 
 > **Thay đổi chính so với v1.0:** xem [Phụ lục A](#phụ-lục-a--changelog-v10--v11) ở cuối tài liệu.
 >
-> 📘 **Hướng dẫn triển khai từng bước:** [docs/implementation/](implementation/README.md) — tài liệu này trả lời "làm gì và vì sao", bộ đó trả lời "gõ gì, theo thứ tự nào".
+> 📘 **Hướng dẫn triển khai từng bước:** [docs/plans/](plans/README.md) — tài liệu này trả lời "làm gì và vì sao", bộ đó trả lời "gõ gì, theo thứ tự nào".
 
 ---
 

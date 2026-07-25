@@ -13,18 +13,51 @@ Repo hiện có React 19 + Vite 8 + TypeScript 6, chưa cài gì thêm. Bốn l�
 | Vấn đề | Chọn | Vì sao |
 |---|---|---|
 | Routing | `react-router` v7 | Chuẩn de-facto, khai báo đơn giản |
-| Data fetching | `@tanstack/react-query` | **Quan trọng nhất** — xem bên dưới |
-| Form + validate | `react-hook-form` + `zod` | Zod dùng lại được để validate response API |
-| Styling | CSS Modules + CSS variables | Không thêm build step, không config |
+| Data fetching | `@tanstack/react-query` | **Quan trọng nhất** — xem 1.2 |
+| **Component library** | **Ant Design v5** | **Được thiết kế đúng cho admin dashboard — xem 1.1** |
+| Form + validate | `<Form>` của antd + `zod` | Form của antd đã tích hợp validate + layout |
 | Biểu đồ (Phase 4, 7) | `recharts` | API đơn giản, đủ cho line/area chart |
 
 ```bash
 cd frontend
-npm i react-router @tanstack/react-query react-hook-form zod @hookform/resolvers recharts
+npm i react-router @tanstack/react-query antd @ant-design/icons dayjs zod recharts
 npm i -D @tanstack/react-query-devtools
 ```
 
-### Vì sao TanStack Query chứ không phải `useEffect` + `fetch`
+Không cần cấu hình build gì thêm — antd v5 tree-shake sẵn, **không** cần `babel-plugin-import` như v4.
+
+### 1.1. Vì sao Ant Design
+
+> Bản trước của tài liệu này khuyên **không** dùng component library. Đó là lời khuyên sai cho dự án này: mục tiêu của bạn là học AWS, nên mọi giờ bỏ ra tự viết Modal hay Table đều là giờ lấy khỏi Phase 3–7.
+
+Ant Design là thư viện duy nhất trong nhóm được thiết kế **chính xác cho admin dashboard nội bộ** — đúng thứ bạn đang làm. Bốn component quan trọng nhất của dự án đều có sẵn, miễn phí, **không cần package phụ nào**:
+
+| Nhu cầu | Component antd | MUI | shadcn/ui |
+|---|---|---|---|
+| Bảng job sort/phân trang/chọn dòng | `<Table>` | cần `@mui/x-data-grid` | tự ghép TanStack Table (~200 dòng) |
+| Timeline execution history | `<Timeline>` | cần `@mui/lab` | **không có**, tự viết |
+| Toast thông báo | `message` / `notification` | **không có**, cần `notistack` | `sonner` |
+| Modal xác nhận | `Modal.confirm()` | tự ghép `<Dialog>` | tự ghép `<AlertDialog>` |
+
+Cộng thêm ba component "bonus" chỉ antd có, dùng được ngay:
+
+- **`<Descriptions>`** — panel label/value. Đúng cho phần đầu trang `/jobs/:ulid` (Status · Type · Created · Attempts).
+- **`<Statistic>`** — 4 thẻ số trên dashboard (Queued / Processing / Completed / Failed).
+- **`<Result>`** — trang trạng thái rỗng/lỗi, có sẵn icon và layout.
+
+`<Timeline>` là lý do mạnh nhất. Màn hình `/jobs/:ulid` với lịch sử execution là màn hình giá trị nhất của cả frontend (xem mục 4), và antd cho bạn nó gần như miễn phí.
+
+**Ước tính: ~5–6 ngày cho 12 màn hình**, so với ~6–7 ngày với MUI và ~10–12 ngày với shadcn.
+
+**Đánh đổi bạn đang chấp nhận:**
+- Giao diện rất "Ant", khó tạo look riêng. Với dự án học AWS thì không phải vấn đề — có thể còn là ưu điểm vì trông chuyên nghiệp ngay từ đầu.
+- CSS-in-JS runtime (`@ant-design/cssinjs`) có chi phí nhỏ. Không đáng kể ở quy mô này.
+- API rất rộng — nhiều prop bạn sẽ không bao giờ dùng. Cứ bỏ qua, đừng cố đọc hết docs.
+- Docs đôi khi dịch từ tiếng Trung hơi cứng, và một số GitHub issue bằng tiếng Trung.
+
+**Mẹo khi mới dùng:** API của antd high-level, nên cách học nhanh nhất là mở trang component trên [ant.design/components](https://ant.design/components/overview) và copy đúng ví dụ gần nhất với nhu cầu. Đừng đọc hết bảng props — chỉ tra khi cần.
+
+### 1.2. Vì sao TanStack Query chứ không phải `useEffect` + `fetch`
 
 Ở [Phase 1](phase-1-local.md) tôi có viết một hook `usePolling` tự chế. Nó chạy được, nhưng với dashboard job thì bạn sẽ phải tự cài lại một loạt thứ mà Query đã có sẵn:
 
@@ -36,9 +69,55 @@ npm i -D @tanstack/react-query-devtools
 
 Cái cuối là lý do đủ mạnh rồi. Tự viết thì lần poll nào bảng cũng chớp trắng.
 
-### Vì sao CSS Modules chứ không phải Tailwind
+antd và TanStack Query **không chồng lấn**: antd lo giao diện, Query lo dữ liệu server. Nối với nhau qua `loading={isLoading}` và `dataSource={data}` là xong.
 
-Dự án này có ~12 màn hình và mục tiêu là học AWS, không phải học CSS framework. CSS Modules + một bộ design token là **0 phút cấu hình** và không có gì để hỏng. Nếu bạn đã quen Tailwind thì cứ dùng — không ảnh hưởng gì tới phần còn lại của tài liệu.
+### 1.3. Setup ban đầu
+
+`src/main.tsx`:
+
+```tsx
+import { ConfigProvider, App as AntApp, theme as antTheme } from 'antd';
+import viVN from 'antd/locale/vi_VN';
+import { QueryClientProvider } from '@tanstack/react-query';
+import dayjs from 'dayjs';
+import 'dayjs/locale/vi';
+import relativeTime from 'dayjs/plugin/relativeTime';
+
+dayjs.locale('vi');
+dayjs.extend(relativeTime);   // cho formatRelativeTime("2 phút trước")
+
+const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+createRoot(document.getElementById('root')!).render(
+  <ConfigProvider
+    locale={viVN}
+    theme={{
+      // Dark mode một dòng — antd tự sinh toàn bộ sắc độ
+      algorithm: prefersDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
+      token: { borderRadius: 8, fontFamily: 'system-ui, sans-serif' },
+    }}
+  >
+    {/* AntApp BẮT BUỘC: nó cấp context cho message/notification/Modal.confirm.
+        Thiếu nó, gọi message.success() sẽ không hiện gì và cũng không báo lỗi. */}
+    <AntApp>
+      <QueryClientProvider client={queryClient}>
+        <AppRoutes />
+      </QueryClientProvider>
+    </AntApp>
+  </ConfigProvider>
+);
+```
+
+> ⚠️ **Hai bẫy khi mới dùng antd v5:**
+>
+> 1. **Phải bọc `<App>` của antd** (đặt alias `AntApp` để không lẫn với component `App` của bạn). Không bọc thì `message.success()` im lặng không làm gì — rất khó debug vì không có lỗi nào.
+> 2. **Dùng hook thay vì import trực tiếp.** `import { message } from 'antd'` rồi gọi `message.success()` sẽ mất theme và locale. Cách đúng:
+>    ```tsx
+>    const { message, modal, notification } = AntApp.useApp();
+>    message.success('Đã tạo job');
+>    ```
+>
+> Không cần import file CSS nào — antd v5 tự inject style.
 
 ---
 
@@ -61,27 +140,16 @@ frontend/src/
 │   ├── job.ts                   # Job, JobStatus, JobExecution
 │   └── schemas.ts               # zod schema, dùng cho cả form lẫn validate response
 │
-├── components/                  # ===== DÙNG CHUNG — viết ở Phase 1 =====
-│   ├── ui/
-│   │   ├── Button.tsx
-│   │   ├── Card.tsx
-│   │   ├── Table.tsx
-│   │   ├── Badge.tsx
-│   │   ├── Modal.tsx
-│   │   ├── Toast.tsx
-│   │   └── Skeleton.tsx
+├── theme.ts                     # bảng màu trạng thái + token antd
+│
+├── components/                  # ===== CHỈ những gì antd KHÔNG có =====
 │   ├── job/
-│   │   ├── JobStatusBadge.tsx   # dùng ở 6 màn hình khác nhau
-│   │   ├── ProgressBar.tsx
-│   │   ├── JobTypeIcon.tsx
-│   │   └── ExecutionTimeline.tsx
-│   ├── layout/
-│   │   ├── AppShell.tsx         # sidebar + header
-│   │   └── PageHeader.tsx
-│   └── state/
-│       ├── EmptyState.tsx
-│       ├── ErrorState.tsx
-│       └── LoadingState.tsx
+│   │   ├── JobStatusTag.tsx     # bọc <Tag> + map màu theo status
+│   │   ├── JobProgress.tsx      # bọc <Progress> + xử lý trạng thái queued
+│   │   ├── ExecutionTimeline.tsx# bọc <Timeline> của antd
+│   │   └── UlidText.tsx         # <Typography.Text code copyable>
+│   └── layout/
+│       └── AppLayout.tsx        # <Layout> + <Menu> của antd
 │
 └── features/                    # ===== MỖI PHASE THÊM MỘT THƯ MỤC =====
     ├── auth/          # Phase 1
@@ -110,46 +178,97 @@ features/jobs/
 
 Quy tắc: **feature không import từ feature khác.** Cần dùng chung thì đưa lên `components/` hoặc `lib/`. Đây là thứ giữ cho Phase 7 không phải sửa code Phase 1.
 
+Chú ý thư mục `components/` **chỉ còn 5 file**, và tất cả đều là lớp bọc mỏng quanh component antd để gắn logic riêng của domain (map màu theo status, xử lý trạng thái `queued`). Không có `EmptyState`/`ErrorState` vì antd đã có `<Empty>` và `<Result>`. Đó chính là lợi ích của việc dùng thư viện.
+
 ---
 
 ## 3. Nền tảng (Phase 1)
 
-### 3.1. Design token
+### 3.1. Theme và bảng màu trạng thái
 
-`src/styles/tokens.css`:
+Với antd, spacing / radius / dark mode đã có sẵn qua `ConfigProvider`. Thứ duy nhất bạn cần khai báo là **bảng màu theo trạng thái job** — và nó phải khai báo **một lần, dùng ở mọi nơi**: tag, biểu đồ, timeline, thẻ thống kê.
 
-```css
-:root {
-  /* Màu theo trạng thái — dùng nhất quán ở MỌI nơi */
-  --status-queued:      #64748b;   /* xám  — đang chờ */
-  --status-processing:  #0ea5e9;   /* xanh — đang chạy */
-  --status-completed:   #10b981;   /* lục  — xong */
-  --status-failed:      #ef4444;   /* đỏ   — hỏng */
-  --status-cancelled:   #a1a1aa;   /* nhạt — người dùng hủy */
-  --status-dead:        #b91c1c;   /* đỏ đậm — DLQ */
+`src/theme.ts`:
 
-  --bg:        #ffffff;
-  --bg-subtle: #f8fafc;
-  --border:    #e2e8f0;
-  --text:      #0f172a;
-  --text-muted:#64748b;
+```ts
+import type { JobStatus } from './types/job';
 
-  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
-  --space-4: 16px; --space-6: 24px; --space-8: 32px;
+// Tên màu preset của antd. Dùng ở MỌI nơi cần <Tag> hoặc <Badge>.
+// antd tự lo sắc độ cho light/dark nên không cần 2 bảng riêng.
+export const STATUS_COLOR: Record<JobStatus, string> = {
+  queued:        'default',
+  processing:    'processing',   // preset đặc biệt: có animation nhấp nháy
+  completed:     'success',
+  failed:        'error',
+  cancelling:    'warning',
+  cancelled:     'default',
+  dead_lettered: 'magenta',
+};
 
-  --radius: 8px;
-  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
-}
+export const STATUS_LABEL: Record<JobStatus, string> = {
+  queued:        'Đang chờ',
+  processing:    'Đang chạy',
+  completed:     'Hoàn thành',
+  failed:        'Thất bại',
+  cancelling:    'Đang hủy',
+  cancelled:     'Đã hủy',
+  dead_lettered: 'Dead letter',
+};
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f172a; --bg-subtle: #1e293b;
-    --border: #334155; --text: #f1f5f9; --text-muted: #94a3b8;
-  }
+// Mã hex cho Recharts (Phase 4, 7) — biểu đồ không đọc được token của antd
+export const STATUS_HEX: Record<JobStatus, string> = {
+  queued: '#8c8c8c', processing: '#1677ff', completed: '#52c41a',
+  failed: '#ff4d4f', cancelling: '#faad14', cancelled: '#595959',
+  dead_lettered: '#eb2f96',
+};
+```
+
+> 💡 Preset `'processing'` của antd `<Tag>` có sẵn hiệu ứng nhấp nháy — đúng cho job đang chạy, không cần tự thêm animation.
+
+`JobStatusTag` giờ chỉ còn 5 dòng:
+
+```tsx
+export function JobStatusTag({ status }: { status: JobStatus }) {
+  return <Tag color={STATUS_COLOR[status]}>{STATUS_LABEL[status]}</Tag>;
 }
 ```
 
-Bảng màu trạng thái là thứ bạn sẽ nhìn hàng nghìn lần trong 6 tháng. Chốt một lần, dùng ở mọi màn hình — badge, biểu đồ, timeline, thẻ thống kê.
+`STATUS_HEX` tồn tại riêng vì Recharts nhận màu dạng string. Giữ ba map đồng bộ — đổi màu thì đổi cả ba.
+
+Nếu cần đọc token của antd trong code (ví dụ để tô màu biểu đồ theo theme hiện tại):
+
+```tsx
+const { token } = theme.useToken();   // token.colorSuccess, token.colorError, ...
+```
+
+### 3.1b. Bảng component — dùng gì cho việc gì
+
+Tra bảng này thay vì tự viết:
+
+| Nhu cầu | Component antd |
+|---|---|
+| Layout sidebar + header | `<Layout>` + `<Layout.Sider>` + `<Menu>` |
+| Thẻ thống kê dashboard | `<Statistic>` trong `<Card>` |
+| Bảng job sort/phân trang/chọn dòng | `<Table>` |
+| Tag trạng thái | `<Tag color="processing">` |
+| Progress bar | `<Progress percent={n}>` |
+| Timeline execution | `<Timeline items={[...]}>` |
+| Panel metadata (Status/Type/Created) | `<Descriptions>` |
+| Skeleton lúc tải | `<Skeleton>` hoặc `<Table loading>` |
+| Toast | `message.success()` qua `App.useApp()` |
+| Modal xác nhận | `modal.confirm()` qua `App.useApp()` |
+| Form + validate | `<Form>` + `<Form.Item rules={[...]}>` |
+| Form input | `<Input> <InputNumber> <Select> <Slider> <Switch>` |
+| JSON payload | `<Typography.Paragraph><pre>` hoặc `<Card>` |
+| Tab trong trang chi tiết | `<Tabs items={[...]}>` |
+| Copy ULID | `<Typography.Text code copyable>` |
+| Tooltip giải thích | `<Tooltip>` |
+| Cảnh báo trang load test | `<Alert type="warning" showIcon>` |
+| Trạng thái rỗng | `<Empty>` |
+| Trang lỗi | `<Result status="error">` |
+| Nút có loading | `<Button loading={mutation.isPending}>` |
+
+**Không có thứ nào phải tự viết.** Đó là điểm mạnh lớn nhất của antd cho dự án này — 5 file trong `components/` chỉ là lớp bọc gắn logic domain.
 
 ### 3.2. API client
 
@@ -366,7 +485,54 @@ export const createJobSchema = z.discriminatedUnion('type', [
 ]);
 ```
 
-Một schema dùng cho cả validate form lẫn suy ra TypeScript type (`z.infer`).
+Zod dùng để suy ra TypeScript type (`z.infer`) và validate response API. Còn **validate form thì dùng `rules` của antd** — nó tích hợp sẵn với layout và hiển thị lỗi:
+
+```tsx
+const [form] = Form.useForm();
+const type = Form.useWatch('type', form);   // theo dõi field để đổi form động
+
+<Form form={form} layout="vertical" onFinish={v => createJob.mutate(v)}
+      initialValues={{ type: 'simulate_work', payload: { duration_seconds: 10 } }}>
+
+  <Form.Item name="type" label="Loại job" rules={[{ required: true }]}>
+    <Select options={JOB_TYPES} />
+  </Form.Item>
+
+  {type === 'simulate_work' && (
+    <>
+      <Form.Item name={['payload', 'duration_seconds']} label="Thời gian (giây)"
+                 rules={[{ required: true, type: 'number', min: 1, max: 60 }]}>
+        <InputNumber min={1} max={60} style={{ width: '100%' }} />
+      </Form.Item>
+
+      <Form.Item name={['payload', 'failure_probability']} label="Tỷ lệ lỗi giả lập">
+        <Slider min={0} max={1} step={0.05}
+                marks={{ 0: '0%', 0.5: '50%', 1: '100%' }} />
+      </Form.Item>
+    </>
+  )}
+
+  <Button type="primary" htmlType="submit" loading={createJob.isPending}>Run</Button>
+</Form>
+```
+
+Hai điểm đáng chú ý:
+
+- **`name={['payload', 'duration_seconds']}`** — antd hỗ trợ path dạng array cho field lồng nhau, nên payload lồng trong object không cần xử lý gì thêm.
+- **`Form.useWatch`** — theo dõi giá trị một field mà không re-render cả form. Đây là cách đúng để làm form động theo `job_type`.
+
+Sau khi submit thành công, map lỗi 422 từ Laravel vào form:
+
+```tsx
+onError: (err) => {
+  if (err instanceof ApiError && err.errors) {
+    form.setFields(Object.entries(err.errors).map(([name, errors]) => ({
+      name: name.split('.'),    // Laravel trả "payload.duration_seconds"
+      errors,
+    })));
+  }
+}
+```
 
 #### `/jobs/:ulid` — Chi tiết (màn hình quan trọng nhất)
 
@@ -395,6 +561,44 @@ Một schema dùng cho cả validate form lẫn suy ra TypeScript type (`z.infer
 
 **Timeline execution là thứ có giá trị nhất của cả frontend.** Nó cho bạn thấy trực quan job đã bị nhận lại mấy lần, worker nào xử lý, lỗi gì ở từng lần. Đây chính là màn hình bạn sẽ nhìn suốt Phase 2 (kiểm chứng DLQ) và Phase 4 (kiểm chứng scale-in không mất job).
 
+Với `<Timeline>` của antd, toàn bộ phần đó là ~20 dòng. API `items` (khuyến nghị từ v5.2, thay cho `<Timeline.Item>` cũ) nhận thẳng một mảng:
+
+```tsx
+<Timeline
+  mode="left"
+  items={executions.map(e => ({
+    color: e.status === 'completed' ? 'green' : e.status === 'failed' ? 'red' : 'blue',
+    dot: e.status === 'running' ? <LoadingOutlined /> : undefined,
+    children: (
+      <>
+        <Space>
+          <Typography.Text strong>Attempt {e.attempt}</Typography.Text>
+          <Tag color={e.status === 'failed' ? 'error' : 'success'}>{e.status}</Tag>
+        </Space>
+        <Typography.Text code type="secondary">{e.worker_id}</Typography.Text>
+        {e.error_message && (
+          <Alert type="error" message={e.error_message} style={{ marginTop: 8 }} />
+        )}
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          {e.duration_ms ? formatDuration(e.duration_ms) : 'đang chạy'} · {dayjs(e.started_at).fromNow()}
+        </Typography.Text>
+      </>
+    ),
+  }))}
+/>
+```
+
+Phần metadata phía trên dùng `<Descriptions>` — 8 dòng thay cho một grid tự làm:
+
+```tsx
+<Descriptions bordered size="small" column={2} items={[
+  { label: 'Status',   children: <JobStatusTag status={job.status} /> },
+  { label: 'Type',     children: job.type },
+  { label: 'Created',  children: dayjs(job.created_at).fromNow() },
+  { label: 'Attempts', children: job.attempts },
+]} />
+```
+
 Khi job xong và có `result_s3_key`, hiện nút Download gọi pre-signed URL.
 
 #### `/load-test`
@@ -416,7 +620,57 @@ Sau khi chạy, chuyển sang màn hình theo dõi realtime với queue depth, s
 
 Danh sách job `dead_lettered` với lỗi lần cuối. **Chọn nhiều + Redrive hàng loạt** — vì DLQ thường có 20 job cùng một nguyên nhân, redrive từng cái là vô nghĩa.
 
-Modal xác nhận nêu rõ hệ quả: "Sẽ tạo message MỚI cho N job. Lịch sử execution cũ được giữ lại."
+`<Table>` của antd có `rowSelection` sẵn, nên phần này gần như không phải viết:
+
+```tsx
+const [selected, setSelected] = useState<string[]>([]);
+const { modal, message } = App.useApp();
+
+<Table
+  rowKey="ulid"
+  dataSource={dlqJobs}
+  loading={isLoading}
+  rowSelection={{ selectedRowKeys: selected, onChange: k => setSelected(k as string[]) }}
+  pagination={{ pageSize: 20, showTotal: t => `${t} job trong DLQ` }}
+  columns={[
+    { title: 'ULID', dataIndex: 'ulid',
+      render: v => <Typography.Text code copyable>{v}</Typography.Text> },
+    { title: 'Type', dataIndex: 'type', filters: JOB_TYPE_FILTERS,
+      onFilter: (v, r) => r.type === v },
+    { title: 'Lỗi lần cuối', dataIndex: 'error_message', ellipsis: true },
+    { title: 'Thất bại lúc', dataIndex: 'failed_at', sorter: true,
+      render: v => dayjs(v).fromNow() },
+  ]}
+/>
+
+<Button type="primary" disabled={!selected.length} onClick={confirmRedrive}>
+  Redrive {selected.length} job
+</Button>
+```
+
+Chú ý `filters` + `onFilter` và `sorter` — antd lo toàn bộ phần sort và filter phía client, không cần viết state gì thêm. Đây là chỗ tiết kiệm nhiều nhất so với tự ghép TanStack Table.
+
+Modal xác nhận dùng `modal.confirm()`, nêu rõ hệ quả:
+
+```tsx
+const confirmRedrive = () => modal.confirm({
+  title: `Redrive ${selected.length} job?`,
+  icon: <ExclamationCircleOutlined />,
+  content: (
+    <>Sẽ tạo message <b>MỚI</b> cho {selected.length} job.
+       Lịch sử execution cũ được giữ lại để đối chiếu.</>
+  ),
+  okText: 'Redrive',
+  cancelText: 'Hủy',
+  onOk: async () => {
+    await redrive.mutateAsync(selected);
+    message.success(`Đã redrive ${selected.length} job`);
+    setSelected([]);
+  },
+});
+```
+
+> 💡 `onOk` trả về Promise thì antd tự hiện loading trên nút OK và chỉ đóng modal khi resolve. Không phải tự quản lý state loading.
 
 ### Phase 4 — `/workers`
 
@@ -460,30 +714,45 @@ Metric từ CloudWatch qua API backend (`GetMetricData`), **không nhúng iframe
 Job vừa tạo ở trạng thái `queued` **chưa chạy gì cả**. Không hiện progress bar 0% đang animate — nó ngụ ý đang có việc diễn ra. Hiện chữ "Đang chờ worker" kèm thời gian chờ:
 
 ```tsx
-{job.status === 'queued' && (
-  <div className={s.waiting}>
-    <Spinner size="sm" />
-    Đang chờ worker · {formatRelativeTime(job.queued_at)}
+{job.status === 'queued' ? (
+  <Space>
+    <Spin size="small" />
+    <Typography.Text type="secondary">
+      Đang chờ worker · {dayjs(job.queued_at).fromNow()}
+    </Typography.Text>
     {waitedOver(job, 120) && (
-      <span className={s.hint}>Worker có thể đang khởi động (mất 2–4 phút)</span>
+      <Tooltip title="Auto scaling mất 2–4 phút để khởi động task mới">
+        <Tag color="warning">Worker đang khởi động?</Tag>
+      </Tooltip>
     )}
-  </div>
+  </Space>
+) : (
+  <Progress
+    percent={job.progress}
+    status={job.status === 'processing' ? 'active'
+          : job.status === 'failed' ? 'exception' : 'success'}
+  />
 )}
 ```
 
-Dòng gợi ý sau 2 phút giúp bạn khỏi tưởng hệ thống hỏng — đúng vào lúc auto scaling đang khởi động task.
+Tag gợi ý sau 2 phút giúp bạn khỏi tưởng hệ thống hỏng — đúng vào lúc auto scaling đang khởi động task.
+
+`status="active"` của antd `<Progress>` có sẵn hiệu ứng sóng chạy, và `status="exception"` tự đổi sang màu đỏ kèm icon ✕. Không cần map màu thủ công.
 
 ### 5.2. Nội suy progress giữa hai lần poll
 
-Poll 3 giây một lần nhưng job cập nhật liên tục → progress bar nhảy giật. Cho CSS lo phần mượt:
+Poll 3 giây một lần nhưng job cập nhật liên tục → progress bar nhảy giật từng bước.
+
+antd không có prop `transitionDuration`, nên override bằng CSS (một lần, trong `index.css`):
 
 ```css
-.fill {
-  transition: width 3s linear;   /* khớp với chu kỳ poll */
+/* Khớp với chu kỳ poll 3 giây -> thanh chạy đều thay vì nhảy */
+.ant-progress-bg {
+  transition: width 3s linear !important;
 }
 ```
 
-Một dòng CSS, khác biệt lớn về cảm giác.
+Một dòng CSS, khác biệt lớn về cảm giác. Đây là một trong rất ít chỗ phải can thiệp vào style của antd.
 
 ### 5.3. Cancel là "yêu cầu", không phải "lệnh"
 
@@ -497,20 +766,25 @@ Sau khi bấm Cancel, trạng thái là `cancelling` chứ không phải `cancel
 
 ### 5.4. Phân biệt "đang tải lần đầu" và "đang làm mới"
 
+`<Table>` có prop `loading` — nó hiện overlay mờ **giữ nguyên dữ liệu cũ** thay vì xóa trắng bảng, đúng hành vi ta cần. Nhưng phải truyền đúng biến:
+
 ```tsx
 const { data, isLoading, isFetching } = useJobs(filters);
 
-if (isLoading) return <TableSkeleton rows={10} />;   // lần đầu: skeleton
+<Table
+  rowKey="ulid"
+  dataSource={data?.data ?? []}
+  loading={isLoading}          // CHỈ lần đầu
+  columns={columns}
+/>
 
-return (
-  <>
-    {isFetching && <div className={s.refreshBar} />}  {/* poll: thanh mảnh trên cùng */}
-    <JobTable jobs={data.data} />
-  </>
-);
+{/* Các lần poll sau: chỉ một thanh mảnh, không phủ overlay lên bảng */}
+{isFetching && !isLoading && (
+  <Progress percent={100} status="active" showInfo={false} size="small" />
+)}
 ```
 
-Không tách hai cái này thì cứ 3 giây bảng lại chớp trắng một lần.
+**Truyền `isFetching` vào `loading` là sai** — cứ 3 giây bảng lại bị phủ overlay và nhảy. Đây là lỗi rất dễ mắc vì hai biến tên gần giống nhau.
 
 ---
 
@@ -629,15 +903,20 @@ Vì đã chọn **token-based auth** (không phải cookie), CORS ở đây rấ
 ## 7. Checklist frontend theo phase
 
 **Phase 1**
-- [ ] Cài router, react-query, react-hook-form, zod
+- [ ] Cài antd + router + react-query + zod + dayjs
+- [ ] `ConfigProvider` + **`<App>` của antd** (thiếu là `message` im lặng) + `QueryClientProvider`
+- [ ] `dayjs.extend(relativeTime)` + locale `vi`
+- [ ] Dùng `App.useApp()` để lấy `message`/`modal`, **không** import trực tiếp từ `antd`
+- [ ] `theme.ts` với `STATUS_COLOR` / `STATUS_LABEL` / `STATUS_HEX`
 - [ ] `lib/api.ts`, `lib/auth.tsx`, `lib/queryClient.ts`
-- [ ] Design token với bảng màu trạng thái
-- [ ] `AppShell` + sidebar
-- [ ] Component dùng chung: Badge, ProgressBar, Table, EmptyState, Skeleton
+- [ ] `AppLayout` (`<Layout>` + `<Menu>`) + badge số DLQ trên nav
+- [ ] 4 component bọc: `JobStatusTag`, `JobProgress`, `ExecutionTimeline`, `UlidText`
 - [ ] 6 màn hình Phase 1
 - [ ] Polling dừng khi mọi job ở trạng thái cuối
 - [ ] Polling dừng khi tab ẩn
-- [ ] Bảng không chớp khi refetch
+- [ ] `<Table loading={isLoading}>` — **không** truyền `isFetching`
+- [ ] CSS override `.ant-progress-bg { transition: width 3s linear }`
+- [ ] Map lỗi 422 của Laravel vào `form.setFields()`
 
 **Phase 2** — [ ] `/dlq` với redrive hàng loạt · [ ] chấm đỏ trên sidebar
 
@@ -656,5 +935,9 @@ Vì đã chọn **token-based auth** (không phải cookie), CORS ở đây rấ
 - **WebSocket / realtime** — polling 3 giây là đủ cho job chạy 5–30 giây. WebSocket cần API Gateway WebSocket hoặc server riêng, tốn tiền và tốn thời gian.
 - **SSR / Next.js** — dashboard sau đăng nhập, không cần SEO, không cần server render.
 - **Redux / Zustand** — TanStack Query đã lo server state; UI state cục bộ dùng `useState` là đủ. Dự án này gần như không có global client state.
-- **Component library (MUI, Ant, shadcn)** — 12 màn hình với ~10 component tự viết thì nhanh hơn là học API của một thư viện.
+- **Tự viết component library** — đây là điều bản đầu của tài liệu khuyên sai. Tự viết Modal / Table / Timeline tốn 3–4 ngày, mà thời gian đó nên dành cho Phase 3–7. Dùng antd (mục 1.1).
+- **Tailwind hoặc CSS framework khác song song với antd** — chọn một. Dùng cả hai là hai hệ thống spacing/màu chồng nhau, tốn thời gian đối chiếu hơn là tiết kiệm.
+- **Thư viện icon khác** — `@ant-design/icons` là đủ, import theo tên nên tree-shake tốt. Không cần Font Awesome hay Lucide.
+- **`@ant-design/pro-components`** — bộ "pro" của antd (ProTable, ProForm) rất mạnh nhưng thêm một tầng abstraction nữa phải học, và nó giả định pattern fetch data riêng — sẽ xung đột với TanStack Query. `<Table>` thường là đủ.
+- **Cố tạo look riêng cho antd** — chỉnh `token` trong `ConfigProvider` là đủ (borderRadius, colorPrimary). Đừng override CSS sâu; đó là hố thời gian không đáy và bạn đang học AWS.
 - **Storybook** — một người làm, không cần.

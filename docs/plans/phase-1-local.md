@@ -1066,9 +1066,11 @@ public function store(Request $request, JobDispatcher $dispatcher)
 
 ## 1.10. React Dashboard
 
-> 📘 Phần dưới đây là bản tóm tắt. **Bản đầy đủ nằm ở [frontend-guide.md](frontend-guide.md)** — stack (react-router, TanStack Query, zod), cấu trúc thư mục theo feature, design token, phác thảo từng màn hình, và các mẫu UX riêng cho hệ thống bất đồng bộ.
+> 📘 Phần dưới đây là bản tóm tắt. **Bản đầy đủ nằm ở [frontend-guide.md](frontend-guide.md)** — stack, cấu trúc thư mục theo feature, theme, phác thảo từng màn hình, và các mẫu UX riêng cho hệ thống bất đồng bộ.
 >
-> Đặc biệt: guide đó khuyên dùng **TanStack Query thay cho hook `usePolling` tự viết** bên dưới — nó xử lý sẵn việc dừng poll khi tab ẩn, dừng khi mọi job đã xong, và không làm bảng chớp mỗi lần refetch.
+> Hai điểm guide đó **thay thế** phần dưới đây:
+> - **Ant Design v5** làm component library — không tự viết Modal/Table/Timeline (tiết kiệm 3–4 ngày).
+> - **TanStack Query** thay cho hook `usePolling` tự viết — xử lý sẵn việc dừng poll khi tab ẩn, dừng khi mọi job đã xong, và không làm bảng chớp mỗi lần refetch.
 
 ### API client — viết một lần, dùng suốt 8 phase
 
