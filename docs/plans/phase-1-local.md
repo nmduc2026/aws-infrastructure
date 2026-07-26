@@ -18,17 +18,24 @@ Phase 1 chiếm khoảng **60% tổng lượng code** của cả dự án và t�
 ## 1.1. Thứ tự thực hiện
 
 ```
-1.2  Docker Compose (MySQL)
-1.3  Database schema — MỘT migration duy nhất cho cả 8 phase
-1.4  Lớp trừu tượng: JobQueue, EventEmitter, ResultStorage, Metrics
-1.5  DatabaseJobQueue — mô phỏng SQS
-1.6  Handler cho từng job_type
-1.7  JobDispatcher (phía API) và JobProcessor (phía worker)
-1.8  Consumer command
-1.9  REST API + Sanctum
-1.10 React: API client, auth, các trang
-1.11 Kiểm thử
+1.2   Docker Compose (MySQL)
+1.3   Database schema — MỘT migration duy nhất cho cả 8 phase
+1.4   Eloquent model
+1.5   Lớp trừu tượng: exception, DTO, interface, implementation
+1.6   DatabaseJobQueue — mô phỏng SQS
+1.7   Service provider — nối driver vào container
+1.8   Handler cho từng job_type
+1.9   Outcome, JobDispatcher (phía API), JobProcessor (phía worker)
+1.10  Consumer command
+1.11  REST API + Sanctum
+1.12  React: API client, auth, các trang
+1.13  Kiểm thử
 ```
+
+Thứ tự này là thứ tự phụ thuộc: **mỗi bước chỉ dùng những gì các bước trước đã tạo ra.** Làm đúng theo nó thì không bước nào phải quay lại sửa bước trước. Hai chỗ dễ bị cám dỗ làm sớm:
+
+- **Service provider (1.7) không nằm chung với interface (1.5).** Provider `new` ra cả 4 implementation, mà `DatabaseJobQueue` mãi 1.6 mới có. Viết provider ở 1.5 thì `php artisan` sẽ đứng ngay vì container không resolve được class chưa tồn tại.
+- **Exception nằm ở 1.5, trước DTO.** `JobMessage::fromArray()` ném `NonRetryableException`, nên exception phải có trước.
 
 ---
 
@@ -40,14 +47,14 @@ Tạo `docker-compose.yml` ở thư mục gốc:
 services:
   mysql:
     image: mysql:8.0
-    container_name: taskflow-mysql
+    container_name: mysql
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: taskflow
       MYSQL_USER: taskflow
-      MYSQL_PASSWORD: secret
+      MYSQL_PASSWORD: 123123
     ports:
-      - "3307:3306"      # 3307 để không đụng MySQL đã cài sẵn trên máy
+      - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -73,10 +80,10 @@ APP_URL=http://localhost:8000
 
 DB_CONNECTION=mysql
 DB_HOST=127.0.0.1
-DB_PORT=3307
+DB_PORT=3306
 DB_DATABASE=taskflow
 DB_USERNAME=taskflow
-DB_PASSWORD=secret
+DB_PASSWORD=123123
 
 # Driver của TaskFlow — Nguyên tắc 4: đổi phase = đổi env, không sửa code
 TASKFLOW_QUEUE_DRIVER=database
@@ -105,63 +112,87 @@ FRONTEND_URL=http://localhost:5173
 ```php
 Schema::create('jobs', function (Blueprint $table) {
     $table->id();
-    $table->ulid('ulid')->unique();          // ID công khai dùng trong message, log, URL
-    $table->foreignId('user_id')->constrained()->cascadeOnDelete();
+    $table->ulid('ulid')->unique(); // Public ID dùng trong message, log, URL
 
-    $table->string('type', 50);              // simulate_work | generate_report | send_email
+    // Relationships
+    $table->foreignId('user_id')
+        ->constrained()
+        ->cascadeOnDelete();
+
+    // Job information
+    $table->string('type', 50); // simulate_work | generate_report | send_email
     $table->string('status', 20)->default('queued');
     $table->string('priority', 10)->default('normal');
 
+    // Payload & result
     $table->json('payload_json');
-    $table->unsignedTinyInteger('progress')->default(0);   // 0..100
+    $table->unsignedTinyInteger('progress')->default(0); // 0..100
     $table->json('result_json')->nullable();
-    $table->string('result_s3_key', 512)->nullable();      // Phase 3 mới dùng
+    $table->string('result_s3_key', 512)->nullable(); // Phase 3
 
-    // Các cột cho phase sau — khai báo sẵn để KHÔNG phải ALTER TABLE (Nguyên tắc 1)
-    $table->boolean('cancel_requested')->default(false);   // Phase 1 (cancel)
-    $table->timestamp('heartbeat_at')->nullable();         // Phase 4 (phát hiện worker chết)
-    $table->boolean('notify')->default(true);              // Phase 5 (bảo vệ hạn mức SES)
+    // Future phases (khai báo trước để tránh ALTER TABLE)
+    $table->boolean('cancel_requested')->default(false); // Phase 1
+    $table->timestamp('heartbeat_at')->nullable(); // Phase 4
+    $table->boolean('notify')->default(true); // Phase 5
 
+    // Error handling
     $table->string('error_code', 50)->nullable();
     $table->text('error_message')->nullable();
     $table->unsignedTinyInteger('attempts')->default(0);
 
+    // Timestamps
     $table->timestamp('created_at')->useCurrent();
     $table->timestamp('queued_at')->nullable();
     $table->timestamp('started_at')->nullable();
     $table->timestamp('completed_at')->nullable();
     $table->timestamp('failed_at')->nullable();
 
-    $table->index(['status', 'created_at']);   // cho maintenance job quét job treo
-    $table->index(['user_id', 'created_at']);  // cho danh sách job của user
+    // Indexes
+    $table->index(['status', 'created_at']); // Maintenance quét job treo
+    $table->index(['user_id', 'created_at']); // Danh sách job của user
     $table->index('type');
 });
 ```
 
 Trạng thái hợp lệ: `queued`, `processing`, `completed`, `failed`, `cancelling`, `cancelled`, `dead_lettered`.
 
-> Không có trạng thái `pending`. Job được insert thẳng với `queued` bên trong transaction, message gửi **sau khi commit** — xem 1.7.
+> Không có trạng thái `pending`. Job được insert thẳng với `queued` bên trong transaction, message gửi **sau khi commit** — xem 1.9.
 
 ### Migration 2 — bảng `job_executions`
 
 ```php
 Schema::create('job_executions', function (Blueprint $table) {
     $table->id();
-    $table->foreignId('job_id')->constrained()->cascadeOnDelete();
-    $table->unsignedTinyInteger('attempt');    // = receive_count của message
-    $table->string('worker_id', 100);          // hostname container
-    $table->string('ecs_task_arn')->nullable();          // Phase 3
+
+    // Relationships
+    $table->foreignId('job_id')
+        ->constrained()
+        ->cascadeOnDelete();
+
+    // Execution information
+    $table->unsignedTinyInteger('attempt'); // = SQS receive_count
+    $table->string('worker_id', 100); // ECS container hostname
+    $table->string('status', 20); // running | completed | failed
+
+    // AWS metadata
+    $table->string('ecs_task_arn')->nullable(); // Phase 3
     $table->string('sqs_receipt_handle', 1024)->nullable();
-    $table->string('status', 20);              // running | completed | failed
+
+    // Execution time
     $table->timestamp('started_at');
     $table->timestamp('finished_at')->nullable();
     $table->unsignedInteger('duration_ms')->nullable();
+
+    // Error handling
     $table->string('error_code', 50)->nullable();
     $table->text('error_message')->nullable();
+
+    // Additional metadata
     $table->json('metadata_json')->nullable();
+
     $table->timestamps();
 
-    // Lớp phòng thủ idempotency ở tầng DB: cùng job + cùng lần nhận = không ghi 2 lần
+    // Idempotency: cùng job + cùng lần nhận chỉ ghi một execution
     $table->unique(['job_id', 'attempt']);
 });
 ```
@@ -173,13 +204,20 @@ Schema::create('job_executions', function (Blueprint $table) {
 ```php
 Schema::create('job_queue_messages', function (Blueprint $table) {
     $table->id();
-    $table->string('queue_name', 80)->index();      // taskflow-jobs | taskflow-jobs-dlq
+
+    // Queue information
+    $table->string('queue_name', 80)->index(); // taskflow-jobs | taskflow-jobs-dlq
     $table->json('body');
+
+    // Message state
     $table->string('receipt_handle', 64)->nullable();
     $table->unsignedTinyInteger('receive_count')->default(0);
-    $table->timestamp('visible_at')->useCurrent();  // trước thời điểm này thì message "vô hình"
+    $table->timestamp('visible_at')->useCurrent(); // Message sẽ "ẩn" đến thời điểm này
+
+    // Timestamps
     $table->timestamp('created_at')->useCurrent();
 
+    // Indexes
     $table->index(['queue_name', 'visible_at']);
 });
 ```
@@ -208,7 +246,7 @@ Schema::create('webhook_deliveries', function (Blueprint $table) {
     $table->foreignId('webhook_id')->constrained()->cascadeOnDelete();
     $table->foreignId('job_id')->constrained()->cascadeOnDelete();
     $table->string('event', 50);
-    $table->string('idempotency_key')->unique();   // chống gửi trùng — xem 1.7
+    $table->string('idempotency_key')->unique();   // chống gửi trùng — xem 1.9
     $table->string('status', 20);                   // pending | sent | failed
     $table->unsignedSmallInteger('http_status')->nullable();
     $table->unsignedTinyInteger('attempt')->default(0);
@@ -225,7 +263,135 @@ cd backend && php artisan migrate
 
 ---
 
-## 1.4. Lớp trừu tượng (Nguyên tắc 2)
+## 1.4. Eloquent model
+
+Migration mới chỉ tạo bảng. Toàn bộ code từ 1.8 trở đi làm việc qua model, nên dựng model ngay bây giờ.
+
+Cài Sanctum ở bước này luôn, vì `User` cần trait `HasApiTokens`. Phần route và controller để tới 1.11.
+
+```bash
+cd backend
+composer require laravel/sanctum
+php artisan vendor:publish --provider="Laravel\Sanctum\SanctumServiceProvider"
+php artisan migrate
+```
+
+`app/Models/User.php` — thêm trait và quan hệ:
+
+```php
+use Laravel\Sanctum\HasApiTokens;
+
+class User extends Authenticatable
+{
+    use HasApiTokens, HasFactory, Notifiable;
+
+    public function jobs(): HasMany
+    {
+        return $this->hasMany(Job::class);
+    }
+}
+```
+
+`app/Models/Job.php`:
+
+```php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\{BelongsTo, HasMany};
+
+class Job extends Model
+{
+    // Bảng `jobs` có created_at do migration tự đặt useCurrent, không có updated_at
+    public $timestamps = false;
+
+    protected $guarded = [];
+
+    // payload_json / result_json là cột JSON — cast để đọc ghi bằng array PHP.
+    // Thiếu cast thì $job->payload_json trả về chuỗi và handler sẽ vỡ.
+    protected $casts = [
+        'payload_json'     => 'array',
+        'result_json'      => 'array',
+        'cancel_requested' => 'boolean',
+        'notify'           => 'boolean',
+        'created_at'       => 'datetime',
+        'queued_at'        => 'datetime',
+        'started_at'       => 'datetime',
+        'completed_at'     => 'datetime',
+        'failed_at'        => 'datetime',
+        'heartbeat_at'     => 'datetime',
+    ];
+
+    // ULID là ID công khai — mọi route dùng nó thay cho id tự tăng
+    public function getRouteKeyName(): string
+    {
+        return 'ulid';
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    public function executions(): HasMany
+    {
+        return $this->hasMany(JobExecution::class)->orderBy('attempt');
+    }
+}
+```
+
+`app/Models/JobExecution.php`:
+
+```php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class JobExecution extends Model
+{
+    protected $guarded = [];
+
+    protected $casts = [
+        'metadata_json' => 'array',
+        'started_at'    => 'datetime',
+        'finished_at'   => 'datetime',
+    ];
+
+    public function job(): BelongsTo
+    {
+        return $this->belongsTo(Job::class);
+    }
+}
+```
+
+`app/Models/Webhook.php` và `app/Models/WebhookDelivery.php` — Phase 5 mới dùng đến, dựng sẵn cho đủ bộ:
+
+```php
+class Webhook extends Model
+{
+    protected $guarded = [];
+    protected $hidden  = ['secret'];
+    protected $casts   = ['events_json' => 'array', 'is_active' => 'boolean'];
+
+    public function user(): BelongsTo { return $this->belongsTo(User::class); }
+}
+
+class WebhookDelivery extends Model
+{
+    protected $guarded = [];
+    protected $casts   = ['sent_at' => 'datetime'];
+
+    public function webhook(): BelongsTo { return $this->belongsTo(Webhook::class); }
+    public function job(): BelongsTo     { return $this->belongsTo(Job::class); }
+}
+```
+
+> 💡 **Vì sao `$guarded = []` chứ không phải `$fillable`:** mọi lệnh ghi vào các bảng này đều xuất phát từ code của ta (dispatcher, processor), không bao giờ từ `$request->all()`. Dữ liệu người dùng luôn đi qua Form Request ở 1.11 rồi mới tới model. Liệt kê `$fillable` ở đây chỉ tạo thêm một chỗ phải nhớ cập nhật mỗi lần thêm cột.
+
+---
+
+## 1.5. Lớp trừu tượng (Nguyên tắc 2)
 
 Đây là phần quyết định việc các phase sau không phải sửa code cũ.
 
@@ -237,7 +403,9 @@ return [
     'queue_driver'   => env('TASKFLOW_QUEUE_DRIVER', 'database'),
     'event_driver'   => env('TASKFLOW_EVENT_DRIVER', 'log'),
     'storage_driver' => env('TASKFLOW_STORAGE_DRIVER', 'local'),
-    'metrics_driver' => env('TASKFLOW_METRICS_DRIVER', 'null'),
+    // Dotenv biến chữ null không có nháy trong .env thành PHP null, không phải
+    // chuỗi 'null' -> dùng ?: để lấy lại giá trị mặc định.
+    'metrics_driver' => env('TASKFLOW_METRICS_DRIVER') ?: 'null',
 
     'queues' => [
         'jobs'              => env('TASKFLOW_QUEUE_JOBS', 'taskflow-jobs'),
@@ -256,6 +424,47 @@ return [
     ],
 ];
 ```
+
+### Exception
+
+Ba class này quyết định toàn bộ cách hệ thống xử lý lỗi, và mọi tầng phía sau đều dùng — DTO ở ngay dưới, handler ở 1.8, processor ở 1.9. Viết trước tiên.
+
+`app/Exceptions/RetryableException.php`:
+
+```php
+namespace App\Exceptions;
+
+use RuntimeException;
+
+/** Lỗi tạm thời — KHÔNG xóa message, để nó quay lại sau visibility timeout */
+class RetryableException extends RuntimeException {}
+```
+
+`app/Exceptions/NonRetryableException.php`:
+
+```php
+namespace App\Exceptions;
+
+use RuntimeException;
+
+/** Lỗi vĩnh viễn — XÓA message ngay, retry không giúp được gì */
+class NonRetryableException extends RuntimeException {}
+```
+
+`app/Exceptions/JobCancelledException.php`:
+
+```php
+namespace App\Exceptions;
+
+use RuntimeException;
+
+/** Người dùng bấm Cancel — XÓA message, status = cancelled */
+class JobCancelledException extends RuntimeException {}
+```
+
+Phân biệt retryable và non-retryable là điều quan trọng nhất trong xử lý lỗi: một bên để message quay lại và cuối cùng vào DLQ, một bên xóa ngay để DLQ chỉ chứa những job thật sự đáng xem lại. Xem [thiết kế mục 13](../taskflow_cloud_design.md).
+
+> Đặt ở `App\Exceptions` chứ không phải `App\Queue`: đây là exception nghiệp vụ của job, dùng chung cho cả DTO, handler và processor — không phải chi tiết riêng của tầng hàng đợi.
 
 ### DTO
 
@@ -320,7 +529,7 @@ final class ReceivedMessage
 }
 ```
 
-### Interface `JobQueue`
+### Interface `app/Contracts/JobQueue.php`
 
 ```php
 interface JobQueue
@@ -344,23 +553,37 @@ Bốn method này ánh xạ 1-1 với API của SQS: `SendMessage`, `ReceiveMess
 
 ### Các interface còn lại
 
+`app/Contracts/EventEmitter.php`:
+
 ```php
 interface EventEmitter {
     public function emit(string $event, string $jobId, array $context = []): void;
 }
+```
 
+`app/Contracts/ResultStorage.php`:
+
+```php
 interface ResultStorage {
     public function put(string $key, string $contents): string;   // trả về key
     public function temporaryUrl(string $key, int $minutes = 15): string;
 }
+```
 
+`app/Contracts/Metrics.php`:
+
+```php
 interface Metrics {
     public function count(string $name, int $value = 1, array $dimensions = []): void;
     public function timing(string $name, int $milliseconds, array $dimensions = []): void;
 }
 ```
 
-Implementation cho Phase 1 rất ngắn:
+### Implementation cho Phase 1
+
+Ba cái này rất ngắn. Mỗi implementation nằm trong thư mục theo lĩnh vực của nó, không nằm cạnh interface — nhờ vậy Phase 2/3/6/7 chỉ việc thêm file mới bên cạnh.
+
+`app/Events/Emitters/LogEventEmitter.php`:
 
 ```php
 final class LogEventEmitter implements EventEmitter {
@@ -368,12 +591,20 @@ final class LogEventEmitter implements EventEmitter {
         Log::info('event.emitted', ['event' => $event, 'job_id' => $jobId] + $context);
     }
 }
+```
 
+`app/Metrics/NullMetrics.php`:
+
+```php
 final class NullMetrics implements Metrics {
     public function count(string $n, int $v = 1, array $d = []): void {}
     public function timing(string $n, int $ms, array $d = []): void {}
 }
+```
 
+`app/Storage/LocalResultStorage.php`:
+
+```php
 final class LocalResultStorage implements ResultStorage {
     public function put(string $key, string $contents): string {
         Storage::disk('local')->put($key, $contents);
@@ -385,42 +616,11 @@ final class LocalResultStorage implements ResultStorage {
 }
 ```
 
-### Service Provider
-
-`app/Providers/TaskFlowServiceProvider.php`:
-
-```php
-public function register(): void
-{
-    $this->app->bind(JobQueue::class, fn () => match (config('taskflow.queue_driver')) {
-        'database' => new DatabaseJobQueue(),
-        'sqs'      => new SqsJobQueue(),       // Phase 2
-    });
-
-    $this->app->bind(EventEmitter::class, fn () => match (config('taskflow.event_driver')) {
-        'log' => new LogEventEmitter(),
-        'sqs' => new SqsEventEmitter(),        // Phase 6
-    });
-
-    $this->app->bind(ResultStorage::class, fn () => match (config('taskflow.storage_driver')) {
-        'local' => new LocalResultStorage(),
-        's3'    => new S3ResultStorage(),      // Phase 3
-    });
-
-    $this->app->bind(Metrics::class, fn () => match (config('taskflow.metrics_driver')) {
-        'null' => new NullMetrics(),
-        'emf'  => new EmfMetrics(),            // Phase 7
-    });
-}
-```
-
-Nhớ đăng ký provider trong `config/app.php`.
-
-**Từ đây trở đi, chuyển phase = sửa `.env`.** Không sửa code nghiệp vụ.
+Còn thiếu duy nhất một implementation: `JobQueue`. Đó là nội dung mục tiếp theo. Có đủ cả bốn rồi mới đấu dây vào container ở 1.7.
 
 ---
 
-## 1.5. `DatabaseJobQueue` — mô phỏng SQS
+## 1.6. `DatabaseJobQueue` — mô phỏng SQS
 
 Đây là class thú vị nhất Phase 1. Đọc kỹ, vì nó dạy bạn chính xác SQS làm gì.
 
@@ -539,7 +739,58 @@ final class DatabaseJobQueue implements JobQueue
 
 ---
 
-## 1.6. Handler cho từng loại job
+## 1.7. Service provider — nối driver vào container
+
+Đủ bốn implementation rồi, giờ mới đấu dây được.
+
+`app/Providers/TaskFlowServiceProvider.php`:
+
+```php
+public function register(): void
+{
+    $this->app->bind(JobQueue::class, fn () => match (config('taskflow.queue_driver')) {
+        'database' => new DatabaseJobQueue(),
+        // 'sqs'      => new SqsJobQueue(),       // Phase 2
+    });
+
+    $this->app->bind(EventEmitter::class, fn () => match (config('taskflow.event_driver')) {
+        'log' => new LogEventEmitter(),
+        // 'sqs' => new SqsEventEmitter(),        // Phase 6
+    });
+
+    $this->app->bind(ResultStorage::class, fn () => match (config('taskflow.storage_driver')) {
+        'local' => new LocalResultStorage(),
+        // 's3'    => new S3ResultStorage(),      // Phase 3
+    });
+
+    $this->app->bind(Metrics::class, fn () => match (config('taskflow.metrics_driver')) {
+        'null' => new NullMetrics(),
+        // 'emf'  => new EmfMetrics(),            // Phase 7
+    });
+}
+```
+
+Đăng ký provider vào mảng `providers` trong `config/app.php`:
+
+```php
+App\Providers\TaskFlowServiceProvider::class,
+```
+
+> Các nhánh `match` của phase sau để nguyên dạng comment. Mở comment ra khi nào file implementation tương ứng đã tồn tại — `match` đánh giá lười, nhưng PHP vẫn phải nạp được class khi nhánh đó chạy, và quan trọng hơn là để tài liệu này khớp với code chạy được ở mọi thời điểm.
+
+Kiểm tra nhanh — lệnh này resolve cả bốn binding, chạy trót lọt nghĩa là đấu dây đúng:
+
+```bash
+php artisan tinker --execute="dump(get_class(app(App\Contracts\JobQueue::class)), get_class(app(App\Contracts\EventEmitter::class)), get_class(app(App\Contracts\ResultStorage::class)), get_class(app(App\Contracts\Metrics::class)));"
+```
+
+**Từ đây trở đi, chuyển phase = sửa `.env`.** Không sửa code nghiệp vụ.
+
+---
+
+## 1.8. Handler cho từng loại job
+
+`app/Contracts/JobHandler.php`:
 
 ```php
 interface JobHandler
@@ -549,7 +800,7 @@ interface JobHandler
 }
 ```
 
-`JobContext` cho handler báo tiến độ và kiểm tra hủy:
+`app/Jobs/JobContext.php` cho handler báo tiến độ và kiểm tra hủy:
 
 ```php
 final class JobContext
@@ -636,7 +887,36 @@ final class GenerateReportHandler implements JobHandler
 }
 ```
 
+### `SendEmailHandler`
+
+`app/Jobs/Handlers/SendEmailHandler.php`. Ở Phase 1 `MAIL_MAILER=log` nên mail chỉ ghi vào `storage/logs/laravel.log` — đủ để kiểm chứng luồng. Phase 5 đổi sang SES mà không phải sửa handler.
+
+```php
+final class SendEmailHandler implements JobHandler
+{
+    public function handle(JobMessage $message, JobContext $ctx): array
+    {
+        $to      = $message->payload['to']      ?? null;
+        $subject = $message->payload['subject'] ?? 'TaskFlow notification';
+        $body    = $message->payload['body']    ?? '';
+
+        // Địa chỉ sai thì gửi lại 3 lần cũng sai y hệt -> lỗi vĩnh viễn
+        if (! $to || ! filter_var($to, FILTER_VALIDATE_EMAIL)) {
+            throw new NonRetryableException("Địa chỉ email không hợp lệ: " . var_export($to, true));
+        }
+
+        $ctx->progress(50);
+
+        Mail::raw($body, fn ($mail) => $mail->to($to)->subject($subject));
+
+        return ['to' => $to, 'subject' => $subject, 'sent_at' => now()->toIso8601String()];
+    }
+}
+```
+
 ### Registry
+
+`app/Jobs/HandlerRegistry.php`:
 
 ```php
 final class HandlerRegistry
@@ -658,21 +938,41 @@ final class HandlerRegistry
 }
 ```
 
-### Exception
-
-```php
-class RetryableException    extends RuntimeException {}   // KHÔNG xóa message
-class NonRetryableException extends RuntimeException {}   // XÓA message ngay
-class JobCancelledException extends RuntimeException {}   // XÓA message, status=cancelled
-```
-
-Phân biệt hai loại này là điều quan trọng nhất trong xử lý lỗi. Xem [thiết kế mục 13](../taskflow_cloud_design.md).
+Ba handler đều chỉ ném exception rồi trả về mảng kết quả — chúng không biết gì về queue, về retry, về DLQ. Toàn bộ phần đó là việc của `JobProcessor` ở mục sau. Thêm một `job_type` mới về sau chỉ là viết một class và thêm một dòng vào `$map`.
 
 ---
 
-## 1.7. `JobDispatcher` và `JobProcessor`
+## 1.9. `Outcome`, `JobDispatcher` và `JobProcessor`
+
+### `Outcome` — kết luận của processor về số phận message
+
+Viết trước vì cả `JobProcessor` ngay dưới lẫn consumer ở 1.10 đều dùng.
+
+`app/Queue/Outcome.php`:
+
+```php
+namespace App\Queue;
+
+enum Outcome
+{
+    case Delete;   // xóa message khỏi queue
+    case Keep;     // để nguyên, chờ visibility timeout hết hạn rồi nhận lại
+    case Retry;    // như Keep nhưng chủ động rút ngắn/kéo dài bằng backoff
+
+    public static function delete(): self { return self::Delete; }
+    public static function keep(): self   { return self::Keep; }
+    public static function retry(): self  { return self::Retry; }
+
+    public function isDelete(): bool { return $this === self::Delete; }
+    public function isRetry(): bool  { return $this === self::Retry; }
+}
+```
+
+> Processor **không** tự gọi `$queue->delete()`. Nó chỉ trả về kết luận, còn consumer ở 1.10 mới thao tác lên queue. Tách như vậy thì processor test được bằng unit test thuần, không cần queue thật.
 
 ### `JobDispatcher` — phía API
+
+`app/Jobs/JobDispatcher.php`:
 
 ```php
 final class JobDispatcher
@@ -709,10 +1009,56 @@ final class JobDispatcher
 
         return $job;
     }
+
+    /**
+     * Gửi lại message cho một job đã tồn tại — dùng cho Retry (1.11)
+     * và cho command requeue-orphans bên dưới.
+     */
+    public function redispatch(Job $job): void
+    {
+        $this->queue->send(
+            config('taskflow.queues.jobs'),
+            new JobMessage(
+                jobId:       $job->ulid,
+                jobType:     $job->type,
+                payload:     $job->payload_json ?? [],
+                requestedBy: $job->user_id,
+                priority:    $job->priority,
+            )
+        );
+    }
 }
 ```
 
-> Trường hợp lỗi còn lại: DB commit xong nhưng `send()` thất bại → job kẹt ở `queued` mãi mãi. Phase 6 sẽ có Maintenance Lambda quét và gửi lại. Ở Phase 1, viết tạm một command `php artisan taskflow:requeue-orphans` làm việc tương tự.
+> Trường hợp lỗi còn lại: DB commit xong nhưng `send()` thất bại → job kẹt ở `queued` mãi mãi. Phase 6 sẽ có Maintenance Lambda quét và gửi lại; ở Phase 1 ta làm bằng một command.
+
+`app/Console/Commands/RequeueOrphans.php`:
+
+```php
+class RequeueOrphans extends Command
+{
+    protected $signature   = 'taskflow:requeue-orphans {--minutes=5 : Job queued lâu hơn ngần này thì coi là mồ côi}';
+    protected $description = 'Gửi lại message cho các job kẹt ở trạng thái queued';
+
+    public function handle(JobDispatcher $dispatcher): int
+    {
+        $cutoff = now()->subMinutes((int) $this->option('minutes'));
+
+        Job::where('status', 'queued')
+            ->where('queued_at', '<', $cutoff)
+            ->chunkById(100, function ($jobs) use ($dispatcher) {
+                foreach ($jobs as $job) {
+                    $dispatcher->redispatch($job);
+                    $this->line("requeued {$job->ulid}");
+                }
+            });
+
+        return self::SUCCESS;
+    }
+}
+```
+
+> Gửi lại có thể tạo message trùng cho job đã thực sự nằm trong queue. Không sao: compare-and-set ở `JobProcessor` ngay dưới khiến bản trùng bị bỏ qua và xóa. Đây chính là lý do phải thiết kế idempotent ngay từ đầu.
 
 ### `JobProcessor` — phía worker
 
@@ -858,11 +1204,11 @@ final class JobProcessor
 }
 ```
 
-`Outcome` là một enum nhỏ: `delete` (xóa message), `keep` (để nguyên, chờ visibility hết hạn), `retry` (như keep nhưng có backoff).
+Ba nhánh `catch` cuối chính là toàn bộ chính sách lỗi của hệ thống, và mỗi nhánh trả về một `Outcome` khác nhau. Consumer ở mục sau chỉ việc thi hành kết luận đó.
 
 ---
 
-## 1.8. Consumer command
+## 1.10. Consumer command
 
 `app/Console/Commands/ConsumeQueue.php`:
 
@@ -947,14 +1293,17 @@ php artisan taskflow:consume
 
 ---
 
-## 1.9. REST API
+## 1.11. REST API
 
 ### Auth — Sanctum token
 
-```bash
-composer require laravel/sanctum
-php artisan vendor:publish --provider="Laravel\Sanctum\SanctumServiceProvider"
-php artisan migrate
+Package đã cài và `User` đã có `HasApiTokens` từ 1.4, giờ chỉ còn bật middleware. Trong `app/Http/Kernel.php`, nhóm `api`:
+
+```php
+'api' => [
+    \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
+    \Illuminate\Routing\Middleware\SubstituteBindings::class,
+],
 ```
 
 > 💡 **Vì sao token chứ không phải cookie SPA:** Sanctum có 2 chế độ. Chế độ SPA dùng cookie, yêu cầu frontend và backend cùng domain cha — ở local chúng là `localhost:5173` và `localhost:8000`, tới Phase 8 lại đổi domain. Chế độ token không quan tâm domain, chỉ cần header `Authorization: Bearer ...`. Ít rắc rối CORS/CSRF hơn hẳn.
@@ -1064,7 +1413,7 @@ public function store(Request $request, JobDispatcher $dispatcher)
 
 ---
 
-## 1.10. React Dashboard
+## 1.12. React Dashboard
 
 > 📘 Phần dưới đây là bản tóm tắt. **Bản đầy đủ nằm ở [frontend-guide.md](frontend-guide.md)** — stack, cấu trúc thư mục theo feature, theme, phác thảo từng màn hình, và các mẫu UX riêng cho hệ thống bất đồng bộ.
 >
@@ -1164,7 +1513,7 @@ Trang `/jobs/:ulid` là trang giá trị nhất — timeline execution cho bạn
 
 ---
 
-## 1.11. Kiểm thử Phase 1
+## 1.13. Kiểm thử Phase 1
 
 Chạy 3 terminal: `php artisan serve`, `npm run dev`, `php artisan taskflow:consume`.
 
