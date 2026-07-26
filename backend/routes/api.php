@@ -2,7 +2,6 @@
 
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
-use App\Http\Controllers\DlqController;
 use App\Http\Controllers\JobController;
 use App\Http\Controllers\LoadTestController;
 use Illuminate\Support\Facades\Route;
@@ -23,6 +22,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/dashboard/summary', [DashboardController::class, 'summary']);
     Route::post('/load-tests',       [LoadTestController::class, 'store']);
 
-    Route::get('/dlq',                  [DlqController::class, 'index']);
-    Route::post('/dlq/{ulid}/redrive',  [DlqController::class, 'redrive']);
+    // DLQ có UI riêng từ Phase 6. Ở Phase 1 xem trực tiếp bảng job_queue_messages.
+    // Route::get('/dlq',                  [DlqController::class, 'index']);
+    // Route::post('/dlq/{ulid}/redrive',  [DlqController::class, 'redrive']);
 });

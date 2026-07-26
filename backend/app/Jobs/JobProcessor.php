@@ -3,7 +3,6 @@
 namespace App\Jobs;
 
 use App\Contracts\EventEmitter;
-use App\Contracts\JobQueue;
 use App\Contracts\Metrics;
 use App\Contracts\ResultStorage;
 use App\Exceptions\JobCancelledException;
@@ -19,8 +18,9 @@ use Throwable;
 
 final class JobProcessor
 {
+    // KHÔNG inject JobQueue: processor chỉ trả về Outcome, consumer mới thao tác
+    // lên queue. Nhờ vậy class này unit test được bằng DB thuần, không cần queue.
     public function __construct(
-        private readonly JobQueue        $queue,
         private readonly HandlerRegistry $handlers,
         private readonly EventEmitter    $events,
         private readonly Metrics         $metrics,
@@ -29,7 +29,17 @@ final class JobProcessor
 
     public function process(string $queueName, ReceivedMessage $received): Outcome
     {
-        $msg   = $received->toJobMessage();
+        // Parse TRƯỚC mọi thứ khác và bắt lỗi ngay tại đây: message hỏng hoặc
+        // sai message_version thì giao lại 100 lần cũng hỏng y hệt. Để lọt
+        // exception ra ngoài là worker chết, message chưa xóa, khởi động lại
+        // nhận đúng nó -> crash loop vĩnh viễn.
+        try {
+            $msg = $received->toJobMessage();
+        } catch (NonRetryableException $e) {
+            Log::error('message.invalid', ['error' => $e->getMessage()]);
+            return Outcome::delete();
+        }
+
         $jobId = $msg->jobId;
 
         $job = Job::where('ulid', $jobId)->first();
@@ -76,10 +86,12 @@ final class JobProcessor
         $job->refresh();
         $started = microtime(true);
 
-        // firstOrCreate + UNIQUE(job_id, attempt): nếu message bị giao trùng
-        // trong cùng một lần nhận thì không tạo execution thứ hai.
+        // attempt lấy từ jobs.attempts — câu CAS phía trên vừa tăng nó, nên số
+        // này tăng đơn điệu suốt vòng đời job. KHÔNG dùng receive_count: Retry
+        // gửi một message MỚI với receive_count reset về 1, sẽ đụng
+        // UNIQUE(job_id, attempt) và ghi đè mất execution của lần chạy trước.
         $execution = JobExecution::firstOrCreate(
-            ['job_id' => $job->id, 'attempt' => $received->receiveCount],
+            ['job_id' => $job->id, 'attempt' => $job->attempts],
             [
                 'worker_id'          => gethostname(),
                 'sqs_receipt_handle' => substr($received->receiptHandle, 0, 1024),
@@ -124,25 +136,44 @@ final class JobProcessor
 
         } catch (NonRetryableException $e) {
             // Lỗi vĩnh viễn: retry 3 lần cũng hỏng y hệt. Xóa luôn, không làm bẩn DLQ.
-            $this->fail($job, $execution, $e, 'permanent');
+            $this->fail($job, $execution, $e, 'permanent', $received);
             $this->events->emit('job.failed', $jobId, ['permanent' => true]);
             return Outcome::delete();
 
         } catch (Throwable $e) {
             // Lỗi tạm thời: KHÔNG xóa message -> nó tự quay lại -> sau 3 lần vào DLQ.
-            $this->fail($job, $execution, $e, 'transient');
+            $this->fail($job, $execution, $e, 'transient', $received);
             return Outcome::retry();
         }
     }
 
-    private function fail(Job $job, JobExecution $exec, Throwable $e, string $kind): void
-    {
+    private function fail(
+        Job $job,
+        JobExecution $exec,
+        Throwable $e,
+        string $kind,
+        ReceivedMessage $received,
+    ): void {
         $permanent = $kind === 'permanent';
+
+        // Đây là lần nhận cuối cùng: lần giao kế tiếp sẽ bị redrive sang DLQ và
+        // job không bao giờ được xử lý nữa. Ghi trạng thái cuối NGAY BÂY GIỜ —
+        // nếu để nguyên 'queued' thì job nằm trong DLQ mà dashboard vẫn đếm là
+        // đang chờ, và requeue-orphans sẽ hồi sinh nó thành rác vô hạn.
+        $exhausted = ! $permanent
+            && $received->receiveCount >= (int) config('taskflow.max_receive_count');
+
+        $status = match (true) {
+            $permanent => 'failed',
+            $exhausted => 'dead_lettered',
+            default    => 'queued',   // transient -> chờ nhận lại
+        };
+
         $job->update([
-            'status'        => $permanent ? 'failed' : 'queued',   // transient -> chờ nhận lại
+            'status'        => $status,
             'error_code'    => $permanent ? 'permanent_error' : 'transient_error',
             'error_message' => Str::limit($e->getMessage(), 1000),
-            'failed_at'     => $permanent ? now() : null,
+            'failed_at'     => $status === 'queued' ? null : now(),
         ]);
         $exec->update([
             'status'        => 'failed',
@@ -152,5 +183,9 @@ final class JobProcessor
         ]);
         $this->metrics->count('JobFailureCount', 1, ['JobType' => $job->type]);
         Log::error('job.failed', ['job_id' => $job->ulid, 'kind' => $kind, 'error' => $e->getMessage()]);
+
+        if ($exhausted) {
+            $this->events->emit('job.dead_lettered', $job->ulid, ['attempts' => $job->attempts]);
+        }
     }
 }

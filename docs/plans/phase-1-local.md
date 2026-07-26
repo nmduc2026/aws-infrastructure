@@ -158,6 +158,8 @@ Trạng thái hợp lệ: `queued`, `processing`, `completed`, `failed`, `cancel
 
 > Không có trạng thái `pending`. Job được insert thẳng với `queued` bên trong transaction, message gửi **sau khi commit** — xem 1.9.
 
+> ⚠️ **`dead_lettered` không tự sinh ra.** Việc message bị đẩy sang DLQ xảy ra ở tầng hàng đợi (`job_queue_messages`), hoàn toàn không đụng tới bảng `jobs`. Nếu không có ai ghi trạng thái này thì job nằm trong DLQ mà bảng `jobs` vẫn là `queued` — dashboard đếm nhầm là đang chờ, và command requeue ở 1.9 sẽ hồi sinh nó thành rác vô hạn. `JobProcessor` ở 1.9 chịu trách nhiệm ghi trạng thái này ở **lần nhận cuối cùng**.
+
 ### Migration 2 — bảng `job_executions`
 
 ```php
@@ -663,7 +665,7 @@ final class DatabaseJobQueue implements JobQueue
                 // Redrive: SQS kiểm tra ĐÚNG ở thời điểm nhận, không phải lúc thất bại.
                 if ($newCount > $maxReceive) {
                     DB::table('job_queue_messages')->where('id', $row->id)->update([
-                        'queue_name'    => $queue . '-dlq',
+                        'queue_name'    => $this->dlqName($queue),
                         'receive_count' => 0,
                         'visible_at'    => now(),
                         'receipt_handle'=> null,
@@ -721,6 +723,18 @@ final class DatabaseJobQueue implements JobQueue
             ->update(['visible_at' => now()->addSeconds($seconds)]);
     }
 
+    /**
+     * Tên DLQ tương ứng. Trên SQS đây là redrive policy gắn vào queue, ở đây ta
+     * tra config trước để đổi tên trong .env có tác dụng thật, rồi mới suy ra
+     * theo quy ước cho các queue chưa khai báo.
+     */
+    private function dlqName(string $queue): string
+    {
+        return $queue === config('taskflow.queues.jobs')
+            ? config('taskflow.queues.jobs_dlq')
+            : $queue . '-dlq';
+    }
+
     public function approximateSize(string $queue): int
     {
         return DB::table('job_queue_messages')
@@ -736,6 +750,8 @@ final class DatabaseJobQueue implements JobQueue
 1. Nhận message **không xóa** nó — chỉ giấu đi trong `visibility_timeout` giây.
 2. Không gọi `delete()` = message tự quay lại. Đây là toàn bộ cơ chế retry, không cần code retry.
 3. `receive_count` tăng ở **mỗi lần nhận**, và redrive kiểm tra lúc nhận. Vượt ngưỡng → sang DLQ.
+
+> Để ý điều gì **không** xảy ra ở đây: class này chỉ di chuyển message giữa hai queue, nó không biết bảng `jobs` tồn tại. SQS thật cũng vậy. Việc đánh dấu `jobs.status = 'dead_lettered'` là của `JobProcessor` ở 1.9 — nếu quên, bạn sẽ có job nằm trong DLQ mà hệ thống vẫn tưởng đang chờ.
 
 ---
 
@@ -812,13 +828,23 @@ final class JobContext
 
     public function progress(int $percent): void
     {
-        $this->job->update(['progress' => min(100, max(0, $percent))]);
+        // heartbeat_at đi kèm progress, không tách rời: câu compare-and-set ở 1.9
+        // dựa vào cột này để biết worker còn sống. Không cập nhật thì job chạy
+        // quá 5 phút sẽ bị chính worker khác giành mất ngay giữa chừng.
+        $this->job->update([
+            'progress'     => min(100, max(0, $percent)),
+            'heartbeat_at' => now(),
+        ]);
     }
 
     /** Handler gọi định kỳ; ném exception nếu người dùng đã bấm Cancel. */
     public function checkCancelled(): void
     {
-        if ($this->job->fresh()->cancel_requested) {
+        // Chỉ đọc đúng một cột. Hàm này chạy mỗi giây trên mọi job đang xử lý —
+        // hydrate cả model bằng fresh() là chi phí thấy rõ khi load test 100 job.
+        $cancelled = Job::where('id', $this->job->id)->value('cancel_requested');
+
+        if ($cancelled) {
             throw new JobCancelledException();
         }
     }
@@ -1044,7 +1070,11 @@ class RequeueOrphans extends Command
     {
         $cutoff = now()->subMinutes((int) $this->option('minutes'));
 
+        // whereNull('error_code'): job vừa lỗi tạm thời cũng mang status 'queued'
+        // nhưng message của nó vẫn nằm trong queue chờ backoff — gửi lại là tạo
+        // message trùng. Chỉ vớt job thật sự chưa từng chạy lần nào.
         Job::where('status', 'queued')
+            ->whereNull('error_code')
             ->where('queued_at', '<', $cutoff)
             ->chunkById(100, function ($jobs) use ($dispatcher) {
                 foreach ($jobs as $job) {
@@ -1068,8 +1098,9 @@ class RequeueOrphans extends Command
 `app/Jobs/JobProcessor.php`
 final class JobProcessor
 {
+    // KHÔNG inject JobQueue: processor chỉ trả về Outcome, consumer ở 1.10 mới
+    // thao tác lên queue. Nhờ vậy class này unit test được bằng DB thuần.
     public function __construct(
-        private readonly JobQueue        $queue,
         private readonly HandlerRegistry $handlers,
         private readonly EventEmitter    $events,
         private readonly Metrics         $metrics,
@@ -1078,7 +1109,17 @@ final class JobProcessor
 
     public function process(string $queueName, ReceivedMessage $received): Outcome
     {
-        $msg   = $received->toJobMessage();
+        // Parse TRƯỚC mọi thứ khác, và bắt lỗi ngay tại đây. Message hỏng hoặc
+        // sai message_version thì giao lại 100 lần cũng hỏng y hệt -> xóa luôn.
+        // Để exception này lọt ra ngoài là worker chết mà message vẫn còn, khởi
+        // động lại nhận đúng nó -> crash loop vĩnh viễn. Đây là "poison message".
+        try {
+            $msg = $received->toJobMessage();
+        } catch (NonRetryableException $e) {
+            Log::error('message.invalid', ['error' => $e->getMessage()]);
+            return Outcome::delete();
+        }
+
         $jobId = $msg->jobId;
 
         $job = Job::where('ulid', $jobId)->first();
@@ -1125,10 +1166,13 @@ final class JobProcessor
         $job->refresh();
         $started = microtime(true);
 
-        // firstOrCreate + UNIQUE(job_id, attempt): nếu message bị giao trùng
-        // trong cùng một lần nhận thì không tạo execution thứ hai.
+        // attempt lấy từ jobs.attempts — câu CAS phía trên vừa tăng nó, nên số này
+        // tăng đơn điệu suốt vòng đời job. KHÔNG dùng receive_count: Retry ở 1.11
+        // gửi một message MỚI với receive_count reset về 1, sẽ đụng
+        // UNIQUE(job_id, attempt) và ghi đè mất execution của lần chạy trước —
+        // đúng thứ lịch sử mà trang /jobs/:ulid sinh ra để hiển thị.
         $execution = JobExecution::firstOrCreate(
-            ['job_id' => $job->id, 'attempt' => $received->receiveCount],
+            ['job_id' => $job->id, 'attempt' => $job->attempts],
             [
                 'worker_id'          => gethostname(),
                 'sqs_receipt_handle' => substr($received->receiptHandle, 0, 1024),
@@ -1173,25 +1217,43 @@ final class JobProcessor
 
         } catch (NonRetryableException $e) {
             // Lỗi vĩnh viễn: retry 3 lần cũng hỏng y hệt. Xóa luôn, không làm bẩn DLQ.
-            $this->fail($job, $execution, $e, 'permanent');
+            $this->fail($job, $execution, $e, 'permanent', $received);
             $this->events->emit('job.failed', $jobId, ['permanent' => true]);
             return Outcome::delete();
 
         } catch (Throwable $e) {
             // Lỗi tạm thời: KHÔNG xóa message -> nó tự quay lại -> sau 3 lần vào DLQ.
-            $this->fail($job, $execution, $e, 'transient');
+            $this->fail($job, $execution, $e, 'transient', $received);
             return Outcome::retry();
         }
     }
 
-    private function fail(Job $job, JobExecution $exec, Throwable $e, string $kind): void
-    {
+    private function fail(
+        Job $job,
+        JobExecution $exec,
+        Throwable $e,
+        string $kind,
+        ReceivedMessage $received,
+    ): void {
         $permanent = $kind === 'permanent';
+
+        // Đây là lần nhận CUỐI CÙNG: lần giao kế tiếp sẽ bị redrive sang DLQ ở
+        // tầng hàng đợi và job này không bao giờ được xử lý nữa. Phải ghi trạng
+        // thái cuối ngay bây giờ, vì sau đây không còn ai chạm vào nó nữa.
+        $exhausted = ! $permanent
+            && $received->receiveCount >= (int) config('taskflow.max_receive_count');
+
+        $status = match (true) {
+            $permanent => 'failed',
+            $exhausted => 'dead_lettered',
+            default    => 'queued',   // transient -> chờ nhận lại
+        };
+
         $job->update([
-            'status'        => $permanent ? 'failed' : 'queued',   // transient -> chờ nhận lại
+            'status'        => $status,
             'error_code'    => $permanent ? 'permanent_error' : 'transient_error',
             'error_message' => Str::limit($e->getMessage(), 1000),
-            'failed_at'     => $permanent ? now() : null,
+            'failed_at'     => $status === 'queued' ? null : now(),
         ]);
         $exec->update([
             'status'        => 'failed',
@@ -1201,11 +1263,22 @@ final class JobProcessor
         ]);
         $this->metrics->count('JobFailureCount', 1, ['JobType' => $job->type]);
         Log::error('job.failed', ['job_id' => $job->ulid, 'kind' => $kind, 'error' => $e->getMessage()]);
+
+        if ($exhausted) {
+            $this->events->emit('job.dead_lettered', $job->ulid, ['attempts' => $job->attempts]);
+        }
     }
 }
 ```
 
 Ba nhánh `catch` cuối chính là toàn bộ chính sách lỗi của hệ thống, và mỗi nhánh trả về một `Outcome` khác nhau. Consumer ở mục sau chỉ việc thi hành kết luận đó.
+
+> 💡 **Ba trạng thái cuối, ba con đường khác nhau — đây là chỗ dễ nhầm nhất:**
+> - `failed` — lỗi vĩnh viễn, message bị xóa ngay, **không** vào DLQ.
+> - `dead_lettered` — lỗi tạm thời đã hết lượt thử, message sẽ bị redrive sang DLQ ở lần giao kế tiếp.
+> - `queued` (kèm `error_message`) — lỗi tạm thời, **vẫn còn lượt**, message đang chờ backoff quay lại.
+>
+> Trạng thái thứ ba khiến job trông như "đang chờ" trên UI dù nó vừa lỗi xong. Đó là lý do frontend ở 1.12 phân biệt bằng `status === 'queued' && attempts > 0 && error_message`.
 
 ---
 
@@ -1252,10 +1325,22 @@ class ConsumeQueue extends Command
             $message = $queue->receive($queueName, waitSeconds: 20);
 
             if (! $message) {
+                if ($this->option('once')) {
+                    break;  // --once trên queue rỗng phải thoát, không chờ mãi
+                }
                 continue;   // long polling hết hạn, không có việc
             }
 
-            $outcome = $processor->process($queueName, $message);
+            // Worker phải sống sót qua MỌI lỗi ngoài dự kiến — mất kết nối DB,
+            // lỗi lập trình trong processor, bất cứ thứ gì. Không bọc thì worker
+            // chết, mà message chưa bị xóa nên lần chạy sau nhận lại đúng nó.
+            try {
+                $outcome = $processor->process($queueName, $message);
+            } catch (Throwable $e) {
+                report($e);
+                $this->error("Lỗi không xử lý được: {$e->getMessage()}");
+                $outcome = Outcome::keep();   // trả message về sau visibility timeout
+            }
 
             match (true) {
                 $outcome->isDelete() => $queue->delete($queueName, $message),
@@ -1329,10 +1414,37 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/dashboard/summary', [DashboardController::class, 'summary']);
     Route::post('/load-tests',       [LoadTestController::class, 'store']);
-
-    Route::get('/dlq',                  [DlqController::class, 'index']);
-    Route::post('/dlq/{ulid}/redrive',  [DlqController::class, 'redrive']);
 });
+```
+
+> Không khai `/dlq` ở đây. Route trỏ tới controller chưa có method là lỗi 500 lúc chạy chứ không phải lỗi lúc khai báo — `php artisan route:list` vẫn xanh, bạn chỉ phát hiện khi gọi thật. Phase 1 xem DLQ trực tiếp bằng SQL trên bảng `job_queue_messages`; UI của nó thuộc Phase 6.
+
+### `StoreJobRequest`
+
+```php
+public function rules(): array
+{
+    return [
+        'type'     => ['required', 'string', Rule::in(['simulate_work', 'generate_report', 'send_email'])],
+        'priority' => ['sometimes', 'string', Rule::in(['normal', 'high', 'low'])],
+        'payload'  => ['required', 'array'],
+
+        // Laravel validated() CHỈ trả về những key có rule. Thiếu khai báo ở đây
+        // thì payload bị cắt sạch, job chạy với giá trị mặc định và bạn sẽ ngồi
+        // debug xem duration_seconds biến đi đâu.
+        'payload.notify'              => ['sometimes', 'boolean'],
+        // max phải nhỏ hơn TASKFLOW_VISIBILITY_TIMEOUT, nếu không message hiện
+        // lại giữa chừng và bị worker thứ hai nhận trong khi job còn đang chạy.
+        'payload.duration_seconds'    => ['sometimes', 'integer', 'min:1', 'max:60'],
+        'payload.failure_probability' => ['sometimes', 'numeric', 'min:0', 'max:1'],
+        'payload.failure_type'        => ['sometimes', 'string', Rule::in(['retryable', 'non_retryable'])],
+        'payload.record_count'        => ['sometimes', 'integer', 'min:1', 'max:100000'],
+        'payload.format'              => ['sometimes', 'string', Rule::in(['csv'])],
+        'payload.to'                  => ['sometimes', 'email'],
+        'payload.subject'             => ['sometimes', 'string', 'max:255'],
+        'payload.body'                => ['sometimes', 'string'],
+    ];
+}
 ```
 
 ### `JobController`
@@ -1373,6 +1485,13 @@ public function cancel(string $ulid, Request $request)
 public function retry(string $ulid, Request $request, JobDispatcher $dispatcher)
 {
     $job = Job::where('ulid', $ulid)->where('user_id', $request->user()->id)->firstOrFail();
+
+    // Chỉ retry job đã kết thúc. Retry một job đang chạy sẽ đẩy thêm một message
+    // trong khi worker cũ vẫn xử lý -> hai execution song song đè progress và
+    // result của nhau. UI có chặn, nhưng API thì ai gọi cũng được.
+    if (! in_array($job->status, ['failed', 'cancelled', 'dead_lettered'])) {
+        return response()->json(['message' => 'Chỉ retry được job đã kết thúc'], 422);
+    }
 
     // KHÔNG "hồi sinh" message cũ — không làm được. Gửi một message MỚI.
     // job_executions cũ giữ nguyên làm lịch sử.
@@ -1518,39 +1637,215 @@ Trang `/jobs/:ulid` là trang giá trị nhất — timeline execution cho bạn
 
 ## 1.13. Kiểm thử Phase 1
 
-Chạy 3 terminal: `php artisan serve`, `npm run dev`, `php artisan taskflow:consume`.
+### Chuẩn bị chung
+
+Chạy 4 terminal (hoặc 3 nếu không cần FE):
+
+```bash
+docker compose up -d
+cd backend && php artisan serve
+cd backend && php artisan taskflow:consume
+cd frontend && npm run dev
+```
+
+- Đăng nhập React (`http://localhost:5173/login`) hoặc dùng API với header `Authorization: Bearer <token>`.
+- Mọi test job đều cần **worker** (`taskflow:consume`) đang chạy, trừ khi ghi chú khác.
+- Sau khi tạo job, mở **`/jobs/:ulid` → tab Payload** và kiểm tra `payload_json` đã lưu đủ field (đặc biệt `duration_seconds`, `failure_probability`). Nếu chỉ thấy `{"notify": true}` thì payload bị cắt lúc validate — xem `StoreJobRequest`.
+
+**Tạo job từ UI (2 chỗ):**
+
+| Cách | Route | Ghi chú |
+|---|---|---|
+| Từng job | `/jobs/new` | Form động theo `job_type` |
+| Hàng loạt | `/load-test` | Luôn là `simulate_work`, có panel theo dõi sau Run |
+
+**Tạo job từ API (mẫu):**
+
+```http
+POST /api/jobs
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "type": "simulate_work",
+  "priority": "normal",
+  "payload": {
+    "duration_seconds": 10,
+    "failure_probability": 0,
+    "failure_type": "retryable",
+    "notify": false
+  }
+}
+```
+
+**Test nhanh (giảm chờ backoff / visibility):** trong `backend/.env`:
+
+```dotenv
+TASKFLOW_VISIBILITY_TIMEOUT=10
+```
+
+Tạm sửa `backoffSeconds()` trong `ConsumeQueue` trả `5` cho mọi attempt (nhớ đổi lại sau khi test xong).
+
+---
 
 ### Test 1 — Luồng thành công
-Tạo job `simulate_work` 10 giây → xem progress bar chạy 10% mỗi giây → `completed`.
+
+**Mục tiêu:** progress tăng đều → `completed`.
+
+**Cách tạo data — UI `/jobs/new`:**
+
+| Field | Giá trị |
+|---|---|
+| Loại job | `simulate_work` |
+| Thời gian (giây) | `10` |
+| Tỷ lệ lỗi | `0%` (kéo slider về 0) |
+| Loại lỗi | `retryable` (không quan trọng khi lỗi = 0) |
+
+**Kiểm tra:** `/jobs/:ulid` — progress ~10%/giây, timeline 1 execution `completed`, status `completed`.
+
+---
 
 ### Test 2 — Retry và DLQ (quan trọng nhất)
-Tạo job với `failure_probability = 1.0`, `failure_type = retryable`.
 
-Quan sát trong DB:
+**Mục tiêu:** message nhận **đúng 3 lần** (3 execution failed), rồi message sang `taskflow-jobs-dlq`.
+
+**Cách tạo data — UI `/jobs/new`:**
+
+| Field | Giá trị |
+|---|---|
+| Loại job | `simulate_work` |
+| Thời gian (giây) | `1` (test nhanh) |
+| Tỷ lệ lỗi | **100%** (kéo slider hẳn sang phải) |
+| Loại lỗi | `retryable` |
+
+**Hoặc `/load-test`:** `count=1`, `duration_seconds=1`, tỷ lệ lỗi `100%`, `failure_type=retryable`.
+
+**Lưu ý:** Lỗi chỉ xảy ra **sau khi** chạy hết `duration_seconds` (progress 100% rồi mới fail). Job hiện `queued` giữa các lần retry — đúng thiết kế, đó là message đang chờ backoff chứ không phải đang chờ worker.
+
+**Kiểm tra FE:** `/jobs/:ulid` → **Execution history** có **3 attempt** failed; lỗi kiểu `Simulated transient failure`. Sau attempt thứ 3, status chuyển sang `dead_lettered` và nút **Retry** bật lên.
+
+**Kiểm tra DB** (thay `?` bằng `jobs.id`):
+
 ```sql
-SELECT queue_name, receive_count, visible_at FROM job_queue_messages;
-SELECT attempt, status, error_code FROM job_executions WHERE job_id = ?;
+SELECT id, ulid, status, attempts FROM jobs WHERE ulid = '01J...';
+
+SELECT queue_name, receive_count, visible_at
+FROM job_queue_messages
+WHERE body LIKE '%01J...%';
+
+SELECT attempt, status, error_code, error_message
+FROM job_executions
+WHERE job_id = ?
+ORDER BY attempt;
 ```
 
-Kỳ vọng: message được nhận **đúng 3 lần**, tạo 3 execution, rồi `queue_name` đổi thành `taskflow-jobs-dlq`.
+**Kỳ vọng:**
 
-Với backoff, tổng thời gian là 30s + 120s + 300s ≈ 7.5 phút. Muốn test nhanh, tạm đặt `TASKFLOW_VISIBILITY_TIMEOUT=10` và sửa `backoffSeconds` trả về 5.
+- `job_executions`: đúng **3** dòng, attempt `1, 2, 3`, đều `failed`.
+- `jobs.status` = **`dead_lettered`**, `attempts` = 3, `failed_at` có giá trị. Đây là điểm dễ sai nhất: nếu bạn thấy `queued` thì nhánh `$exhausted` trong `JobProcessor::fail()` chưa chạy — job sẽ kẹt vĩnh viễn và `taskflow:requeue-orphans` sẽ hồi sinh nó.
+- `job_queue_messages`: sau lần nhận thứ 4 (vượt `max_receive_count=3`), `queue_name` = `taskflow-jobs-dlq`.
+
+Trang `/dlq` chưa có ở Phase 1 — chỉ xem DB.
+
+Bấm **Retry** trên `/jobs/:ulid` lúc này phải tạo execution **attempt 4** (không đè lên attempt 1). Nếu timeline vẫn chỉ có 3 dòng thì `attempt` đang lấy từ `receive_count` thay vì `jobs.attempts`.
+
+Với backoff mặc định, tổng thời gian ≈ 30s + 120s + 300s (~7.5 phút). Dùng `TASKFLOW_VISIBILITY_TIMEOUT=10` và `backoffSeconds` = 5 để test nhanh.
+
+---
 
 ### Test 3 — Lỗi vĩnh viễn
-`failure_type = non_retryable` → **đúng 1** execution, `status = failed`, message bị xóa, **không** vào DLQ.
+
+**Mục tiêu:** **1** execution, `status = failed`, message xóa khỏi queue, **không** vào DLQ.
+
+**Cách tạo data — UI `/jobs/new`:**
+
+| Field | Giá trị |
+|---|---|
+| Loại job | `simulate_work` |
+| Thời gian (giây) | `1` |
+| Tỷ lệ lỗi | `100%` |
+| Loại lỗi | **`non_retryable`** |
+
+**Kiểm tra FE:** 1 attempt failed; job `failed`; không có attempt 2/3.
+
+**Kiểm tra DB:** `job_executions` đúng **1** dòng; không có message tương ứng trong `job_queue_messages` (đã delete).
+
+---
 
 ### Test 4 — Idempotency
-Chạy **2 worker** cùng lúc ở 2 terminal. Tạo 20 job. Kiểm tra:
+
+**Mục tiêu:** Hai worker không xử lý cùng một job đồng thời (compare-and-set).
+
+**Cách tạo data:**
+
+1. Terminal A: `php artisan taskflow:consume`
+2. Terminal B: `php artisan taskflow:consume` (worker thứ hai)
+3. **`/load-test`:** `count=20`, `duration_seconds=10`, tỷ lệ lỗi `0%`
+
+**Kiểm tra:**
+
 ```sql
-SELECT job_id, COUNT(*) FROM job_executions GROUP BY job_id HAVING COUNT(*) > 1;
+SELECT job_id, COUNT(*) AS c
+FROM job_executions
+GROUP BY job_id
+HAVING c > 1;
 ```
-Không job nào được xử lý 2 lần đồng thời. Log sẽ có `job.already_claimed` — đó là compare-and-set đang làm việc.
+
+**Kỳ vọng:** Không có job nào bị **2 execution cùng attempt** do race (mỗi lần *nhận message* là một attempt; job retry Test 2 có nhiều attempt là bình thường). Log worker có thể có `job.already_claimed`.
+
+---
 
 ### Test 5 — Giành lại job từ worker chết
-Tạo job 60 giây. Đang chạy thì `Ctrl+C` **cứng** worker (đóng luôn terminal). Chờ 5 phút → chạy worker mới → nó giành lại được job nhờ điều kiện `heartbeat_at < NOW() - INTERVAL 5 MINUTE`.
+
+**Mục tiêu:** Worker mới giành job sau khi worker cũ chết, heartbeat quá 5 phút.
+
+**Cách tạo data — UI `/jobs/new`:**
+
+| Field | Giá trị |
+|---|---|
+| `simulate_work` | `duration_seconds` = **60** |
+| Tỷ lệ lỗi | `0%` |
+
+1. Chạy worker, đợi job `processing`.
+2. **Đóng cứng** terminal worker (`Ctrl+C` hoặc đóng cửa sổ) — không graceful shutdown.
+3. Chờ **≥ 5 phút** (điều kiện SQL trong `JobProcessor`).
+4. Chạy worker mới → job tiếp tục / hoàn thành.
+
+**Kiểm tra:** `/jobs/:ulid` — có thể thấy execution từ worker cũ và worker mới; job không kẹt `processing` mãi.
+
+---
 
 ### Test 6 — Cancel
-Tạo job 30 giây, bấm Cancel giữa chừng → dừng trong vòng ~1 giây, `status = cancelled`.
+
+**Mục tiêu:** Hủy giữa chừng trong ~1 giây (checkpoint mỗi giây).
+
+**Cách tạo data — UI `/jobs/new`:**
+
+| Field | Giá trị |
+|---|---|
+| `simulate_work` | `duration_seconds` = **30** |
+| Tỷ lệ lỗi | `0%` |
+
+1. Đợi job `processing`.
+2. Trên **`/jobs/:ulid`** bấm **Cancel**.
+3. UI có thể hiện `cancelling` rồi `cancelled`.
+
+**Kiểm tra:** Status `cancelled`; execution dừng gần thời điểm bấm Cancel.
+
+---
+
+### Test bổ sung — Các `job_type` khác
+
+| Type | UI `/jobs/new` | Kỳ vọng |
+|---|---|---|
+| `generate_report` | `record_count` = 1000, `format` = csv | `completed`; file dưới `storage/app/results/` |
+| `send_email` | `to` = email hợp lệ, `MAIL_MAILER=log` | `completed`; nội dung trong `storage/logs/laravel.log` |
+
+---
+
+### Test bổ sung — Load test 100 job (Definition of Done)
+
+**`/load-test`:** `count=100`, `duration_seconds=5`, tỷ lệ lỗi `0%`, một worker (hoặc hai nếu máy đủ mạnh). Dùng panel **Theo dõi load test** và `/jobs` để xem tiến độ.
 
 ---
 
@@ -1561,8 +1856,10 @@ Tạo job 30 giây, bấm Cancel giữa chừng → dừng trong vòng ~1 giây,
 - [ ] Tạo job từ UI, worker xử lý, progress bar cập nhật
 - [ ] 3 job type đều chạy (`simulate_work`, `generate_report`, `send_email`)
 - [ ] `generate_report` ghi được file ra `storage/app/results/`
-- [ ] Test 2: job lỗi tạm thời được nhận **đúng 3 lần** rồi vào `taskflow-jobs-dlq`
+- [ ] Test 2: job lỗi tạm thời được nhận **đúng 3 lần**, message vào `taskflow-jobs-dlq` và `jobs.status` = `dead_lettered`
 - [ ] Test 3: job lỗi vĩnh viễn chỉ **1** execution, không vào DLQ
+- [ ] Retry một job `dead_lettered` tạo execution mới (attempt 4), không đè lịch sử cũ
+- [ ] `taskflow:consume --once` thoát ngay khi queue rỗng
 - [ ] Test 4: 2 worker chạy song song, không job nào xử lý trùng
 - [ ] Test 5: giành lại được job từ worker đã chết
 - [ ] Test 6: Cancel dừng job trong vòng 2 giây

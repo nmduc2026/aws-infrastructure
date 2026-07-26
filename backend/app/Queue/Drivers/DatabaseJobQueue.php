@@ -45,7 +45,7 @@ final class DatabaseJobQueue implements JobQueue
                 // Redrive: SQS kiểm tra ĐÚNG ở thời điểm nhận, không phải lúc thất bại.
                 if ($newCount > $maxReceive) {
                     DB::table('job_queue_messages')->where('id', $row->id)->update([
-                        'queue_name'    => $queue . '-dlq',
+                        'queue_name'    => $this->dlqName($queue),
                         'receive_count' => 0,
                         'visible_at'    => now(),
                         'receipt_handle'=> null,
@@ -101,6 +101,18 @@ final class DatabaseJobQueue implements JobQueue
             ->where('queue_name', $queue)
             ->where('receipt_handle', $message->receiptHandle)
             ->update(['visible_at' => now()->addSeconds($seconds)]);
+    }
+
+    /**
+     * Tên DLQ tương ứng. Trên SQS đây là redrive policy gắn vào queue, ở đây ta
+     * tra config trước để đổi tên trong .env có tác dụng thật, rồi mới suy ra
+     * theo quy ước cho các queue chưa khai báo.
+     */
+    private function dlqName(string $queue): string
+    {
+        return $queue === config('taskflow.queues.jobs')
+            ? config('taskflow.queues.jobs_dlq')
+            : $queue . '-dlq';
     }
 
     public function approximateSize(string $queue): int

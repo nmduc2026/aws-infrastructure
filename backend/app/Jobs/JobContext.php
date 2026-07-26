@@ -15,13 +15,23 @@ final class JobContext
 
     public function progress(int $percent): void
     {
-        $this->job->update(['progress' => min(100, max(0, $percent))]);
+        // heartbeat_at đi kèm progress: câu compare-and-set trong JobProcessor
+        // dựa vào nó để biết worker còn sống. Không cập nhật thì job chạy quá
+        // 5 phút sẽ bị worker khác giành mất ngay giữa chừng.
+        $this->job->update([
+            'progress'     => min(100, max(0, $percent)),
+            'heartbeat_at' => now(),
+        ]);
     }
 
     /** Handler gọi định kỳ; ném exception nếu người dùng đã bấm Cancel. */
     public function checkCancelled(): void
     {
-        if ($this->job->fresh()->cancel_requested) {
+        // Chỉ đọc đúng một cột — hàm này chạy mỗi giây trên mọi job đang xử lý,
+        // hydrate cả model bằng fresh() là lãng phí thấy rõ khi load test.
+        $cancelled = Job::where('id', $this->job->id)->value('cancel_requested');
+
+        if ($cancelled) {
             throw new JobCancelledException();
         }
     }

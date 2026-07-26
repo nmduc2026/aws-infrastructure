@@ -4,7 +4,9 @@ namespace App\Console\Commands;
 
 use App\Contracts\JobQueue;
 use App\Jobs\JobProcessor;
+use App\Queue\Outcome;
 use Illuminate\Console\Command;
+use Throwable;
 
 class ConsumeQueue extends Command
 {
@@ -45,10 +47,22 @@ class ConsumeQueue extends Command
             $message = $queue->receive($queueName, waitSeconds: 20);
 
             if (! $message) {
+                if ($this->option('once')) {
+                    break;  // --once trên queue rỗng phải thoát, không chờ mãi
+                }
                 continue;   // long polling hết hạn, không có việc
             }
 
-            $outcome = $processor->process($queueName, $message);
+            // Worker phải sống sót qua MỌI lỗi ngoài dự kiến (mất kết nối DB,
+            // lỗi lập trình trong processor...). Không bọc thì worker chết,
+            // message chưa bị xóa nên lần chạy sau nhận lại đúng nó -> crash loop.
+            try {
+                $outcome = $processor->process($queueName, $message);
+            } catch (Throwable $e) {
+                report($e);
+                $this->error("Lỗi không xử lý được: {$e->getMessage()}");
+                $outcome = Outcome::keep();   // trả message về sau visibility timeout
+            }
 
             match (true) {
                 $outcome->isDelete() => $queue->delete($queueName, $message),

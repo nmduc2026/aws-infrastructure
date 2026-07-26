@@ -29,7 +29,11 @@ class RequeueOrphans extends Command
     {
         $cutoff = now()->subMinutes((int) $this->option('minutes'));
 
+        // whereNull('error_code'): job vừa lỗi tạm thời cũng mang status 'queued'
+        // nhưng message của nó vẫn nằm trong queue chờ backoff. Gửi lại là tạo
+        // message trùng — chỉ vớt job thật sự chưa từng chạy lần nào.
         Job::where('status', 'queued')
+            ->whereNull('error_code')
             ->where('queued_at', '<', $cutoff)
             ->chunkById(100, function ($jobs) use ($dispatcher) {
                 foreach ($jobs as $job) {

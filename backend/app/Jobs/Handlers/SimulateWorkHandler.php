@@ -22,7 +22,7 @@ final class SimulateWorkHandler implements JobHandler
             $ctx->checkCancelled();     // phản hồi lệnh Cancel trong vòng 1 giây
         }
 
-        if (mt_rand() / mt_getrandmax() < $failProb) {
+        if ($failProb >= 1.0 || ($failProb > 0 && mt_rand() / mt_getrandmax() < $failProb)) {
             throw $failType === 'retryable'
                 ? new RetryableException('Simulated transient failure')
                 : new NonRetryableException('Simulated permanent failure');
