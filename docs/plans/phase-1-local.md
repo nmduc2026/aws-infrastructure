@@ -1065,6 +1065,7 @@ class RequeueOrphans extends Command
 Đây là trái tim của hệ thống.
 
 ```php
+`app/Jobs/JobProcessor.php`
 final class JobProcessor
 {
     public function __construct(
@@ -1230,12 +1231,14 @@ class ConsumeQueue extends Command
         // ECS gửi SIGTERM khi scale in hoặc deploy, rồi chờ stopTimeout giây
         // mới SIGKILL. Không xử lý tín hiệu này thì job đang chạy bị giết ngang.
         // Phase 4 phụ thuộc hoàn toàn vào đoạn code này.
-        pcntl_async_signals(true);
-        pcntl_signal(SIGTERM, function () {
-            $this->shouldStop = true;
-            $this->info('SIGTERM nhận được — ngừng nhận message mới, xử lý nốt việc đang làm');
-        });
-        pcntl_signal(SIGINT, fn () => $this->shouldStop = true);
+        if(function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, function () {
+                $this->shouldStop = true;
+                $this->info('SIGTERM nhận được — ngừng nhận message mới, xử lý nốt việc đang làm');
+            });
+            pcntl_signal(SIGINT, fn () => $this->shouldStop = true);
+        }
 
         $this->info("Worker khởi động | queue={$queueName} | host=" . gethostname());
         $started = time();
